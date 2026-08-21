@@ -97,8 +97,7 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN) as stream:
+        with _input_stream() as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
@@ -140,13 +139,36 @@ class Ears:
                         return transcribe(np.concatenate(frames))
 
 
+def _input_stream() -> sd.InputStream:
+    """Open the mic, surviving a device switch mid-session.
+
+    Field-caught: PortAudio caches the device list when it initializes,
+    and a Bluetooth headset flipping between listen and mic modes
+    (AirPods do this every time the mic opens) invalidates the cached
+    device. Every capture after that dies with -9986 until the process
+    restarts, so the voice line looks alive and never hears another
+    word. Re-initializing refreshes the list; one retry recovers.
+    """
+    opts = dict(samplerate=RATE, channels=1, dtype="int16",
+                blocksize=FRAME_LEN)
+    try:
+        return sd.InputStream(**opts)
+    except sd.PortAudioError:
+        print("[ears] audio device changed — reopening the mic", flush=True)
+        try:
+            sd._terminate()
+        except sd.PortAudioError:
+            pass  # already torn down; re-initializing is the part that counts
+        sd._initialize()
+        return sd.InputStream(**opts)
+
+
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
     """Hold-to-talk capture: record raw audio while is_held() is True,
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                        blocksize=FRAME_LEN) as stream:
+    with _input_stream() as stream:
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
