@@ -46,6 +46,60 @@ _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 _model = None
 _model_lock = threading.Lock()
 
+_mic_warned = False
+
+
+def _mic_index():
+    """Resolve CFG["mic_device"] (a device NAME) to a sounddevice index.
+    Re-resolved on every stream open rather than cached at startup,
+    because indices shift as devices come and go. None means "system
+    default", which is what sounddevice's device=None already means."""
+    global _mic_warned
+    want = str(CFG.get("mic_device", "") or "").strip()
+    if not want:
+        return None
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        log(f"[ears] could not enumerate audio devices ({e}) — "
+            f"using the system default mic")
+        return None
+    ins = [(i, d) for i, d in enumerate(devices)
+           if d["max_input_channels"] > 0]
+    for i, d in ins:                     # exact name first
+        if d["name"] == want:
+            _mic_warned = False
+            return i
+    low = want.lower()
+    for i, d in ins:                     # then case-insensitive substring
+        if low in d["name"].lower():
+            _mic_warned = False
+            return i
+    if not _mic_warned:                  # warn once per disappearance
+        _mic_warned = True
+        log(f"[ears] mic_device {want!r} not found — falling back to the "
+            f"system default. Available inputs: "
+            f"{[d['name'] for _, d in ins]}")
+    return None
+
+
+def _open_mic():
+    """Open the capture stream on the configured mic, degrading to the
+    system default if that device won't open — unplugged between the
+    lookup and the open, busy, or refusing the sample rate."""
+    dev = _mic_index()
+    try:
+        return sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                              blocksize=FRAME_LEN, device=dev)
+    except Exception as e:
+        if dev is None:
+            raise
+        log(f"[ears] could not open mic_device "
+            f"{CFG.get('mic_device')!r} ({e}) — falling back to the "
+            f"system default")
+        return sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+                              blocksize=FRAME_LEN)
+
 
 def warm():
     """Load the STT model (first call downloads it to the HF cache).
@@ -97,8 +151,7 @@ class Ears:
         in_utterance = False
         elapsed = 0.0
 
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=FRAME_LEN) as stream:
+        with _open_mic() as stream:
             while True:
                 block, _ = stream.read(FRAME_LEN)
                 elapsed += FRAME_MS / 1000
@@ -145,8 +198,7 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
     then transcribe. The button is the VAD — no endpointing. Returns
     None for taps shorter than min_s (accidental presses)."""
     frames: list[np.ndarray] = []
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                        blocksize=FRAME_LEN) as stream:
+    with _open_mic() as stream:
         while is_held() and len(frames) * FRAME_MS / 1000 < max_s:
             block, _ = stream.read(FRAME_LEN)
             frames.append(block[:, 0].copy())
