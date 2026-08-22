@@ -54,6 +54,7 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
 import json
+import os
 import queue
 import sys
 import threading
@@ -288,7 +289,10 @@ def make_permission_gate(mouth):
 # from a community member's own build shared in the Discord.)
 CONSOLE_VERBS = {
     "clear":     ("clear the session", "clear the context",
-                  "clear context", "fresh slate", "slash clear"),
+                  "clear context", "fresh slate", "slash clear",
+                  # natural answers to the resumed-launch "continue or
+                  # start fresh?" question
+                  "start fresh", "new session", "start a new session"),
     "compact":   ("compact the session", "compact the context",
                   "compact context", "slash compact"),
     "deep":      ("switch to the deep model", "use the deep model",
@@ -315,6 +319,15 @@ CONSOLE_VERBS = {
                   "ask for permission again"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# Spoken in place of the silent warmup ping when a launch reattached to
+# the previous conversation (config: resume_last_session).
+RESUME_RECAP = (
+    "We just relaunched and reattached to this conversation. In two "
+    "short spoken sentences: say what we were in the middle of, then "
+    "ask whether I want to continue or start fresh. Don't do any work "
+    "yet. If I want fresh, I'll say 'start fresh'; otherwise I'll just "
+    "keep talking.")
 
 
 def console_match(text):
@@ -658,6 +671,12 @@ async def amain():
         await asyncio.wait_for(brain.start(), 120)
 
         async def _warmup():
+            if brain.resumed:
+                # Reattached to the last conversation: the warmup turn
+                # is spoken, so the person hears where they left off
+                # and can choose to continue or start over.
+                await speak_reply(brain, mouth, RESUME_RECAP)
+                return
             async for _ in brain.ask_stream(
                     "Warmup ping - reply with the single word: ready"):
                 pass
@@ -708,6 +727,15 @@ async def amain():
         say_after = None
         if verb == "clear":
             resp = await brain.command("/clear")
+            # A fresh start is also a fresh launch: drop the saved
+            # resume id so a relaunch right after comes up cold instead
+            # of reattaching to an empty conversation. The file is
+            # rewritten on the next completed turn.
+            try:
+                from backtalk.brain import SESSION_FILE
+                os.remove(SESSION_FILE)
+            except OSError:
+                pass
             say_after = "Cleared. Fresh slate."
         elif verb == "compact":
             mouth.say("Compacting. One moment.")

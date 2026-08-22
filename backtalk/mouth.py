@@ -29,6 +29,15 @@ first sentence is audible while later ones are still rendering. Playback
 is cancellable mid-word: set the stop event and the speaker goes silent
 within one audio block plus the device buffer (~0.15s).
 
+Two threads, not one: a synth thread renders chunks AHEAD of the one
+playing (LOOKAHEAD deep), so when a chunk ends the next one's audio is
+already sitting there finished and plays with no gap. One thread doing
+render-then-play-then-render put a synth-latency-plus-prebuffer pause
+(~1s) at every chunk boundary, while the text had long since reached the
+screen. A generation counter ties the two threads together for barge-in:
+shut_up() bumps it, and every chunk rendered or queued under the old
+generation is dropped instead of played.
+
 HARD-WON AUDIO LAW #1 — ONE long-lived OutputStream, reused for every
 sentence for the life of the process. A fresh stream per sentence gives
 an audible onset blip or a beat of dead air on plenty of audio setups
@@ -248,17 +257,47 @@ def synth_stream(text: str, timeout: float = 30.0):
         yield KOKORO_RATE, pcm
 
 
+LOOKAHEAD = 2      # chunks rendered ahead of the one playing
+_DONE = object()   # end-of-render marker on a _Render's pcm queue
+
+
+class _Render:
+    """One chunk's audio in flight from the synth thread to the player.
+    PCM blocks stream through `pcm` as they render (rate is set before
+    the first one lands), _DONE closes it. `gen` is the barge-in
+    generation the chunk was ordered under; stale means shut_up() has
+    happened since and the chunk must never play."""
+    __slots__ = ("text", "gen", "pcm", "rate")
+
+    def __init__(self, text: str, gen: int):
+        self.text = text
+        self.gen = gen
+        self.pcm: queue.Queue = queue.Queue()
+        self.rate: int | None = None
+
+
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
-        self._q: queue.Queue = queue.Queue()
+        self._q: queue.Queue = queue.Queue()            # (gen, text) in
+        self._ready: queue.Queue = queue.Queue(maxsize=LOOKAHEAD)
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        # Barge-in generation: shut_up() bumps it, and anything ordered
+        # under an older one is dropped wherever it's found. _pending
+        # counts current-generation chunks not yet played — "queue
+        # empty" stopped meaning "nothing left" once rendering ran ahead
+        # of playback, so the speaking flag and wait_done key off this.
+        self._gen = 0
+        self._pending = 0
+        self._lock = threading.Lock()
         # The one persistent output stream (audio law #1).
-        # Worker-thread-only — never touch from other threads.
+        # Player-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        self._synth = threading.Thread(target=self._render_loop, daemon=True)
+        self._synth.start()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -269,7 +308,7 @@ class Mouth:
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put(s)
+            self._enqueue(s)
 
     def say_chunk(self, text: str):
         """Queue text as ONE TTS request, no sentence splitting — fuller
@@ -277,16 +316,28 @@ class Mouth:
         dull)."""
         text = text.strip()
         if text:
-            self._q.put(text)
+            self._enqueue(text)
+
+    def _enqueue(self, text: str):
+        with self._lock:
+            self._pending += 1
+            self._q.put((self._gen, text))
 
     def shut_up(self):
-        """Barge-in: stop current playback and flush everything queued."""
+        """Barge-in: stop current playback and flush everything queued
+        or rendering. Bump the generation FIRST, then raise stop: the
+        player clears stop and then checks the generation, and that
+        order pair is what leaves no window for a dead chunk to play."""
+        with self._lock:
+            self._gen += 1
+            self._pending = 0
         self._stop.set()
-        try:
-            while True:
-                self._q.get_nowait()
-        except queue.Empty:
-            pass
+        for q_ in (self._q, self._ready):
+            try:
+                while True:
+                    q_.get_nowait()
+            except queue.Empty:
+                pass
 
     def shutdown(self):
         """Exit path: stop playback and restore the music SYNCHRONOUSLY
@@ -295,31 +346,57 @@ class Mouth:
         self.ducker.restore_now()
 
     def wait_done(self, timeout: float | None = None):
-        """Block until the queue is drained and playback finished."""
+        """Block until everything queued has played."""
         import time
         deadline = None if timeout is None else time.time() + timeout
-        while (not self._q.empty()) or self._speaking.is_set():
+        while self._pending > 0 or self._speaking.is_set():
             time.sleep(0.05)
             if deadline and time.time() > deadline:
                 return
 
+    def _render_loop(self):
+        """Synth thread: render chunks in order, LOOKAHEAD ahead of the
+        player. A render is handed over BEFORE it's filled, so the first
+        chunk still starts after the prebuffer rather than after the
+        whole render; _ready's bound is what throttles the lookahead."""
+        while True:
+            gen, text = self._q.get()
+            if gen != self._gen:
+                continue
+            r = _Render(text, gen)
+            self._ready.put(r)
+            try:
+                for rate, pcm in synth_stream(text):
+                    if gen != self._gen:
+                        break     # barged in: don't finish a dead chunk
+                    r.rate = rate
+                    r.pcm.put(pcm)
+            except Exception as e:
+                log(f"[mouth] synth error: {e}")
+            finally:
+                r.pcm.put(_DONE)
+
     def _run(self):
         from backtalk import signals
         while True:
-            sentence = self._q.get()
-            if not sentence:
-                continue
+            r = self._ready.get()
             self._stop.clear()
+            if r.gen != self._gen:
+                continue
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence)
+                self._play_render(r)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
-                if self._q.empty():
+                with self._lock:
+                    if r.gen == self._gen:
+                        self._pending -= 1
+                    done = self._pending <= 0
+                if done:
                     self._speaking.clear()
                     self.ducker.speech_end()
                     signals.set_state("idle")
@@ -363,26 +440,29 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, block: int = 2205,
+    def _play_render(self, r: _Render, block: int = 2205,
                      prebuffer_s: float = 0.75):
-        """Stream-synthesize and play with the head-start buffer (audio
-        law #2). stop() reacts ~50ms. The sample rate comes from
-        whichever engine actually answered."""
+        """Play one render as it fills, with the head-start buffer (audio
+        law #2) — already satisfied instantly for any chunk that finished
+        rendering while the previous one played. stop() reacts ~50ms.
+        The sample rate comes from whichever engine actually answered."""
         from backtalk import signals
-        gen = synth_stream(sentence)
         head: list = []
         banked = 0
-        rate = None
-        for rate_, pcm in gen:
-            rate = rate_
+        finished = False
+        while True:
+            pcm = r.pcm.get()
+            if pcm is _DONE:
+                finished = True
+                break
             head.append(pcm)
             banked += len(pcm)
-            if banked >= int(rate * prebuffer_s):
+            if banked >= int(r.rate * prebuffer_s):
                 break
-        if rate is None:
+        if not head:
             return
         try:
-            out = self._get_out(rate)
+            out = self._get_out(r.rate)
 
             def _write(pcm):
                 for i in range(0, len(pcm), block):
@@ -400,7 +480,10 @@ class Mouth:
                 if not _write(pcm):
                     self._cut()
                     return
-            for _, pcm in gen:
+            while not finished:
+                pcm = r.pcm.get()
+                if pcm is _DONE:
+                    break
                 if not _write(pcm):
                     self._cut()
                     return
