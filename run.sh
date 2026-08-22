@@ -20,6 +20,16 @@
 # Terminal-invoked (inherits the terminal's mic permission). Ctrl-C hangs up.
 cd "$(dirname "$0")"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# WSL2 self-heal: PortAudio's ALSA pulse plugin looks for the socket at
+# the standard XDG runtime path regardless of $PULSE_SERVER, but WSLg
+# only creates it at /mnt/wslg/PulseServer. Without this symlink, audio
+# playback crashes the process outright ("terminate called ... dumped
+# core") instead of failing cleanly. This tmpfs dir resets every reboot,
+# so re-link it here on every launch rather than once.
+if [ -S /mnt/wslg/PulseServer ] && [ ! -S "/run/user/$(id -u)/pulse/native" ]; then
+  mkdir -p "/run/user/$(id -u)/pulse"
+  ln -sf /mnt/wslg/PulseServer "/run/user/$(id -u)/pulse/native"
+fi
 # Single-instance guard: a stale voice session left in a background
 # terminal answers the same mic alongside a fresh launch = two voices at
 # once, and it sounds haunted. One body, one mouth.
