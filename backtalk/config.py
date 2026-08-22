@@ -88,6 +88,19 @@ DEFAULTS = {
     # (the switch saves itself here). The --open-mic launch flag
     # forces "open" for one session.
     "mic_mode": "ptt",
+    # The microphone to record from, matched by NAME — indices are not
+    # stable, they shift every time a device connects or disconnects,
+    # which is the exact event this setting exists to survive. "" means
+    # "whatever the OS calls the default input" (the old behavior). Set
+    # a real device name to PIN the mic, so a headset connecting for
+    # OUTPUT can't steal your input — which also keeps a Bluetooth
+    # headset in high-quality A2DP instead of dropping it to the
+    # narrowband HFP call profile mid-sentence. Exact name match wins,
+    # otherwise the first case-insensitive substring match. A name that
+    # matches nothing falls back to the system default with a logged
+    # warning: the mic degrades, it never goes mute.
+    # NOT "stt_device" below — that is the Whisper COMPUTE device.
+    "mic_device": "",
     # Playback speed for the built-in voice: 1.0 is Kokoro's native
     # pace, 1.15 is noticeably brisker, 0.9 is slower. Kokoro's own
     # pipeline implements it, so quality holds across sane values
