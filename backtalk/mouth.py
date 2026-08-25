@@ -42,7 +42,9 @@ slow-motion garble.
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 
 import numpy as np
@@ -80,6 +82,79 @@ def _ensure_espeak():
             break
 
 
+# Every espeak library filename phonemizer might copy, across platforms.
+# A directory holding exactly one of these and nothing else is a
+# phonemizer scratch dir and nobody else's.
+_ESPEAK_LIB_NAMES = (
+    "espeak-ng.dll",
+    "libespeak-ng.dll",
+    "libespeak-ng.so",
+    "libespeak-ng.so.1",
+    "libespeak-ng.dylib",
+)
+
+
+def _is_orphan_espeak_tempdir(path: str) -> bool:
+    """True only for a directory whose entire contents are a single espeak
+    shared library. phonemizer's scratch dirs look exactly like this and
+    nothing else on the system does, so this is the check that makes the
+    sweep safe to point at the shared temp directory."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    return len(entries) == 1 and entries[0] in _ESPEAK_LIB_NAMES
+
+
+def _sweep_orphan_espeak_tempdirs():
+    """Delete espeak scratch dirs left behind by previous runs.
+
+    phonemizer copies the espeak shared library into a fresh mkdtemp() for
+    every backend it builds, because espeak-ng keeps its state in globals
+    and dlopen refuses to load the same file twice (see the comment in
+    phonemizer/backend/espeak/api.py). Kokoro builds several backends, so
+    one voice line start leaves several of these behind.
+
+    On POSIX that cleanup rides on weakref.finalize and happens promptly.
+    On Windows phonemizer can only register it with atexit, and atexit does
+    not run when a process is *killed* rather than exited. Anything that
+    launches backtalk from a wrapper and stops it by terminating the process
+    — a launcher script, a service wrapper, a supervisor — therefore leaks
+    every directory it ever created. Sixty had accumulated on the machine
+    where this was found; the count grows per backend per start and never
+    falls.
+
+    Patching phonemizer in site-packages is not a fix, because an install
+    step that runs `uv sync` or `pip install -U` on launch overwrites it.
+    Sweeping at our own startup bounds the total at one run's worth instead.
+
+    Safety rests on two things, not on guesswork:
+      1. we only touch directories whose sole content is an espeak library;
+      2. Windows refuses to delete a DLL that is currently loaded, so a
+         concurrently running instance's directory fails the rmtree and is
+         left alone. The OS enforces that, we don't have to detect it.
+    """
+    root = tempfile.gettempdir()
+    swept = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(root, name)
+        if not os.path.isdir(path) or not _is_orphan_espeak_tempdir(path):
+            continue
+        try:
+            shutil.rmtree(path)
+            swept += 1
+        except OSError:
+            # In use by a live espeak, or not ours to delete. Either way,
+            # leaving it is correct — the next start will get it.
+            pass
+    if swept:
+        log(f"[mouth] swept {swept} orphaned espeak temp dir(s)")
+
+
 def warm():
     """Load the Kokoro pipeline (first call downloads the model to the
     HF cache). Called at startup while the greeting text is composed."""
@@ -87,6 +162,9 @@ def warm():
     with _pipe_lock:
         if _pipe is None:
             _ensure_espeak()
+            # Before kokoro creates this run's scratch dirs, clear out the
+            # ones previous runs could not clean up on their way out.
+            _sweep_orphan_espeak_tempdirs()
             from kokoro import KPipeline
             # The voice name's first letter IS the language pipeline:
             # a=American English, b=British English, e/f/h/i/j/p/z = the
