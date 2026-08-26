@@ -184,6 +184,95 @@ def _stream_elevenlabs(text: str, timeout: float):
         raise feed_error[0]
 
 
+def _fish_cfg() -> dict:
+    """The "fish" block (Fish Audio engine). Read with .get so a config
+    written before this engine existed keeps working unchanged."""
+    return CFG.get("fish") or {}
+
+
+_fish_key_cache: str | None = None
+
+
+def _fish_key_slot() -> str:
+    """The credential-store entry name, so someone who already keeps a
+    key under their own name points at it instead of storing a second
+    copy."""
+    return str(_fish_cfg().get("key_slot") or "backtalk-fish")
+
+
+def _get_fish_key() -> str:
+    """The Fish Audio API key, from the most secure store available —
+    NEVER from a file in this repo. Same lookup order as ElevenLabs:
+      1. macOS Keychain, item `backtalk-fish` by default (change it with
+         fish.key_slot) — seed it once with:
+         security add-generic-password -a "$USER" -s backtalk-fish -T /usr/bin/security -w
+      2. Linux secret-tool (libsecret):
+         secret-tool store --label backtalk service backtalk-fish
+      3. the FISH_AUDIO_API_KEY environment variable — the last-resort
+         fallback, and the only option on Windows for now."""
+    global _fish_key_cache
+    if _fish_key_cache is not None:
+        return _fish_key_cache
+    import subprocess
+    key = ""
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(["security", "find-generic-password",
+                                "-s", _fish_key_slot(), "-w"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                key = r.stdout.strip()
+        elif sys.platform.startswith("linux"):
+            from shutil import which
+            if which("secret-tool"):
+                r = subprocess.run(["secret-tool", "lookup", "service",
+                                    _fish_key_slot()],
+                                   capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    key = r.stdout.strip()
+    except Exception:
+        pass
+    _fish_key_cache = key or os.environ.get("FISH_AUDIO_API_KEY", "")
+    return _fish_key_cache
+
+
+def _fish_ready() -> bool:
+    f = _fish_cfg()
+    return bool(f.get("enabled") and f.get("reference_id")
+                and _get_fish_key())
+
+
+def _stream_fish(text: str, timeout: float):
+    """Fish Audio -> raw PCM stream -> int16 chunks. No ffmpeg needed:
+    format "pcm" streams 16-bit mono at the requested sample_rate, so
+    bytes go from the wire to the speaker path directly. The `model`
+    header picks the TTS generation (s1 default); `reference_id` is the
+    user's own cloned voice."""
+    import httpx
+
+    f = _fish_cfg()
+    rate = int(f.get("sample_rate") or 44100)
+    carry = b""
+    with httpx.stream(
+            "POST", "https://api.fish.audio/v1/tts",
+            headers={"Authorization": f"Bearer {_get_fish_key()}",
+                     "model": str(f.get("model") or "s1"),
+                     "Content-Type": "application/json"},
+            json={"text": text,
+                  "reference_id": f["reference_id"],
+                  "format": "pcm",
+                  "sample_rate": rate,
+                  "latency": str(f.get("latency") or "balanced")},
+            timeout=timeout) as r:
+        r.raise_for_status()
+        for chunk in r.iter_bytes(chunk_size=4096):
+            data = carry + chunk
+            usable = len(data) - (len(data) % 2)
+            carry = data[usable:]
+            if usable:
+                yield rate, np.frombuffer(data[:usable], dtype=np.int16)
+
+
 _el_key_cache: str | None = None
 
 
@@ -241,8 +330,17 @@ def _elevenlabs_ready() -> bool:
 
 def synth_stream(text: str, timeout: float = 30.0):
     """One sentence -> yields (sample_rate, pcm_chunk) as the TTS
-    renders. ElevenLabs when configured, Kokoro otherwise — and Kokoro
-    as the fallback on ANY ElevenLabs failure. Degrade, never mute."""
+    renders. Fish Audio or ElevenLabs when configured, Kokoro otherwise —
+    and Kokoro as the fallback on ANY cloud failure. Degrade, never
+    mute."""
+    if _fish_ready():
+        try:
+            for rate, pcm in _stream_fish(text, timeout):
+                yield rate, pcm
+            return
+        except Exception as e:
+            log(f"[mouth] fish audio failed ({str(e)[:60]}) — "
+                f"falling back to {CFG['voice']}")
     if _elevenlabs_ready():
         try:
             for pcm in _stream_elevenlabs(text, timeout):
