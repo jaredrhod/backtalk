@@ -242,18 +242,32 @@ def _fish_ready() -> bool:
                 and _get_fish_key())
 
 
+_fish_http = None
+
+
+def _get_fish_http():
+    """One keep-alive connection to Fish Audio for the life of the
+    process. A fresh client per sentence pays a TLS handshake inside the
+    gap between spoken sentences; reuse shaves ~0.2-0.4s off each.
+    httpx.Client is thread-safe, and the mouth synthesizes from a single
+    worker thread anyway."""
+    global _fish_http
+    if _fish_http is None:
+        import httpx
+        _fish_http = httpx.Client()
+    return _fish_http
+
+
 def _stream_fish(text: str, timeout: float):
     """Fish Audio -> raw PCM stream -> int16 chunks. No ffmpeg needed:
     format "pcm" streams 16-bit mono at the requested sample_rate, so
     bytes go from the wire to the speaker path directly. The `model`
     header picks the TTS generation (s1 default); `reference_id` is the
     user's own cloned voice."""
-    import httpx
-
     f = _fish_cfg()
     rate = int(f.get("sample_rate") or 44100)
     carry = b""
-    with httpx.stream(
+    with _get_fish_http().stream(
             "POST", "https://api.fish.audio/v1/tts",
             headers={"Authorization": f"Bearer {_get_fish_key()}",
                      "model": str(f.get("model") or "s1"),
