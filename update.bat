@@ -6,15 +6,36 @@ rem
 rem Your backtalk.json is yours: nothing in this script can touch or overwrite it.
 rem Safe to run any time; when nothing is new it just says so.
 
-rem run from a temp copy so updating this very file mid-run cannot garble it
+rem cmd reads a .bat by byte offset, so a script that pulls a new copy of
+rem ITSELF mid-run gets garbled from that point on. Relaunch from a copy
+rem before doing any work.
+rem
+rem The copy lives in this program's own folder under LOCALAPPDATA and NOT
+rem in the system temp directory. Identical protection, and it stops the
+rem script reading like something stashing an executable where nobody
+rem looks. Reviewers read repos too, and copy-to-temp-then-run is the
+rem shape people are trained to distrust.
+rem
+rem Invoked WITHOUT `call` deliberately: cmd hands control to the copy and
+rem never returns here, so not one further byte of this file is read after
+rem the pull rewrites it. If the copy cannot be made, execution falls
+rem through to :run below and does the work in place.
 if "%~1"=="__run__" goto run
-copy /y "%~f0" "%TEMP%\backtalk-update.bat" >nul
-call "%TEMP%\backtalk-update.bat" __run__ "%~dp0"
-exit /b %errorlevel%
+if not defined LOCALAPPDATA goto run
+set "RUNDIR=%LOCALAPPDATA%\backtalk"
+if not exist "%RUNDIR%\" mkdir "%RUNDIR%" >nul 2>nul
+copy /y "%~f0" "%RUNDIR%\update-run.bat" >nul
+"%RUNDIR%\update-run.bat" __run__ "%~dp0"
 
 :run
 setlocal
-cd /d "%~2"
+rem Where the work happens. Normally the relaunched copy is handed the
+rem original folder as %2. On the fallback path above (no LOCALAPPDATA,
+rem or the copy could not be made) there is no %2, so resolve to this
+rem file's own folder instead of cd-ing to nowhere.
+set "HOME_DIR=%~2"
+if not defined HOME_DIR set "HOME_DIR=%~dp0"
+cd /d "%HOME_DIR%"
 set CFG=backtalk.json
 
 if exist ".git\" goto havegit

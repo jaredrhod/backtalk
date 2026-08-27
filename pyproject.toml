@@ -8,6 +8,12 @@ dependencies = [
     "faster-whisper>=1.0.0",
     "httpx>=0.27.0",
     "kokoro>=0.9.0",
+    # Apple Silicon only: runs the SAME whisper model on the GPU.
+    # CTranslate2 (under faster-whisper) has no Metal backend, so
+    # without this every Mac transcribes on the CPU. Measured 0.88s
+    # -> 0.12s on an M4 Max with an identical transcript. Every other
+    # platform keeps faster-whisper, which already uses CUDA.
+    "mlx-whisper>=0.4.0 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "numpy>=1.26.0",
     "pynput>=1.8.0",
     "setuptools<81",

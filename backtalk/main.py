@@ -55,6 +55,7 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 import asyncio
 import json
 import queue
+import re
 import sys
 import threading
 import time
@@ -390,6 +391,12 @@ _PASTE_ON = "\x1b[200~"    # bracketed-paste markers (we enable the mode below)
 _PASTE_OFF = "\x1b[201~"
 
 
+# <<anything>> is a stage direction: lifted out, never spoken, published on
+# the bus when the audio carrying it starts. Bounded so a runaway model cannot
+# swallow a paragraph into one "tag".
+_DIRECTION_TAG = re.compile(r"<<([^<>]{1,80})>>")
+
+
 def _clean_typed(line: str) -> str:
     """Scrub terminal-copy artifacts: blockquote gutter glyphs and stray
     whitespace (copying from a CLI chat render drags bars along)."""
@@ -568,30 +575,45 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
     t0 = time.time()
     first = True
     batch: list[str] = []
+    pending: list[str] = []          # directions waiting for their chunk
 
     def emit(raw: str):
-        nonlocal first, batch
-        # TTS hygiene: backticks, markdown fences and angle-bracket tag
-        # syntax are never speakable — the mouth gets clean prose only.
-        s = raw.replace("`", "").replace("<<", "").replace(">>", "").strip()
+        nonlocal first, batch, pending
+        # STAGE DIRECTIONS: your agent may write <<anything>> inline. It is
+        # lifted out here, never spoken, and published on the signal bus when
+        # this chunk's audio starts (signals.direction). backtalk has no
+        # opinion on what a direction means; something watching the bus does.
+        #
+        # This used to strip only the ANGLE BRACKETS, which left the tag body
+        # in the sentence and the TTS read it aloud.
+        found = _DIRECTION_TAG.findall(raw)
+        if found:
+            pending += [d.strip() for d in found if d.strip()]
+        raw = _DIRECTION_TAG.sub(" ", raw)
+        # TTS hygiene: backticks and markdown fences are never speakable.
+        s = " ".join(raw.replace("`", "").split()).strip()
         if not s:
             return
         if first:
-            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}")
-            mouth.say_chunk(s)
+            log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
+                + (f"  <directions: {pending}>" if pending else ""))
+            mouth.say_chunk(s, pending)
+            pending = []
             first = False
         else:
-            log(f"[{NAME}] {s}")
+            log(f"[{NAME}] {s}" + (f"  <directions: {pending}>" if pending else ""))
             batch.append(s)
             if len(batch) >= 2:
-                mouth.say_chunk(" ".join(batch))
+                mouth.say_chunk(" ".join(batch), pending)
+                pending = []
                 batch = []
 
     try:
         async for sentence in brain.ask_stream(text):
             emit(sentence)
         if batch:
-            mouth.say_chunk(" ".join(batch))
+            mouth.say_chunk(" ".join(batch), pending)
+            pending = []
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.

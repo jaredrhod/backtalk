@@ -51,6 +51,8 @@ _STATE_FILE = os.path.join(_DIR, ".voice_state")
 _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
 _RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
+_DIRECTION_FILE = os.path.join(_DIR, ".voice_direction")
+_REPLY_DONE_FILE = os.path.join(_DIR, ".voice_reply_done")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -127,6 +129,42 @@ def feed_waveform(pcm: np.ndarray):
     except (OSError, ValueError):
         pass
     set_state("speaking")
+
+
+def direction(items):
+    """Stage directions the agent wrote into its reply, published at the
+    moment the audio carrying them starts playing.
+
+    Your agent can emit `<<anything>>` inline and backtalk will never speak
+    it. What the tag MEANS is deliberately not backtalk's business: it
+    publishes the raw strings and something else decides. That is the whole
+    reason this is a file and not a plugin API.
+
+    The timing is the point, and it is the one part a watcher cannot do for
+    itself: these fire when the sentence becomes AUDIBLE, not when the model
+    generated it. A screen cue lands on the spoken word instead of seconds
+    early. Never raises."""
+    if not items:
+        return
+    try:
+        with open(_DIRECTION_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "directions": list(items)}))
+    except OSError:
+        pass
+
+
+def reply_done():
+    """One reply has finished speaking and its audio has fully drained.
+
+    Distinct from the state going idle, which also happens in the gaps
+    BETWEEN sentences of the same reply. Anything waiting for the agent to
+    genuinely stop talking wants this rather than a state flicker. Never
+    raises."""
+    try:
+        with open(_REPLY_DONE_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time()}))
+    except OSError:
+        pass
 
 
 def _player_cmd(path: str) -> list[str] | None:

@@ -101,6 +101,7 @@ class WarmBrain:
                 permission_mode=sdk_mode,
                 can_use_tool=self._can_use_tool,
                 add_dirs=CFG["extra_dirs"],
+                skills=CFG["visible_skills"],
                 resume=rid,
             )
         if resume:
