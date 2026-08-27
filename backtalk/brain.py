@@ -32,6 +32,7 @@ import asyncio
 import os
 import re
 import warnings
+from datetime import datetime
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
@@ -40,6 +41,7 @@ try:
 except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
+from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
@@ -163,6 +165,29 @@ class WarmBrain:
             c = getattr(rm, "total_cost_usd", None)
             if c:
                 s["cost"] += float(c)
+        except Exception:
+            pass
+
+    async def _pull_rate_limits(self):
+        """Pull real 5h/7d usage straight from the CLI's own `get_usage`
+        control request — a direct query, not the sparse RateLimitEvent
+        stream (which fires rarely and often omits utilization entirely).
+        Must never break a turn; silence on any failure."""
+        try:
+            usage = await self._client._query._send_control_request(
+                {"subtype": "get_usage"})
+            rl = usage.get("rate_limits") or {}
+            for window in ("five_hour", "seven_day"):
+                w = rl.get(window)
+                if not w:
+                    continue
+                util = w.get("utilization")
+                util = util / 100 if util is not None else None
+                resets_at = w.get("resets_at")
+                if resets_at:
+                    resets_at = int(datetime.fromisoformat(resets_at)
+                                     .timestamp())
+                signals.set_rate_limit(window, util, resets_at)
         except Exception:
             pass
 
@@ -295,6 +320,7 @@ class WarmBrain:
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
                 self._remember_session(msg)
+                await self._pull_rate_limits()
                 break
         tail = buf.strip()
         if tail:

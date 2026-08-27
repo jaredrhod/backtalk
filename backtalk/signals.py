@@ -23,6 +23,8 @@ is the whole integration surface:
   .voice_state        idle | listening | thinking | speaking
   .voice_waveform     JSON {ts, samples: [64 floats]} while audio plays
   .voice_loading_pid  exists while the thinking sound is playing
+  .voice_rate_limits  JSON {five_hour: {utilization, resets_at},
+                      seven_day: {utilization, resets_at}}
 
 Written to signals_dir (default: the repo root). Visualizers built on
 this contract just work.
@@ -48,6 +50,7 @@ _DIR = CFG["signals_dir"]
 _STATE_FILE = os.path.join(_DIR, ".voice_state")
 _WAVEFORM_FILE = os.path.join(_DIR, ".voice_waveform")
 _LOADING_PID_FILE = os.path.join(_DIR, ".voice_loading_pid")
+_RATE_LIMIT_FILE = os.path.join(_DIR, ".voice_rate_limits")
 
 _BH = CFG.get("barehands_state_dir") or ""
 _BH_STATE = os.path.join(_BH, "state") if _BH else ""
@@ -73,6 +76,29 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+_rate_limits: dict = {}
+
+
+def set_rate_limit(rate_limit_type: str, utilization: float | None,
+                    resets_at: int | None):
+    """Merge one rate-limit window's reading and write the full set.
+
+    Each CLI event reports a single window (e.g. "five_hour"), so this
+    merges into the running dict rather than overwriting it — a face
+    reading the bus should always see the latest known value for both
+    windows, not just whichever one changed last.
+    """
+    if not rate_limit_type:
+        return
+    _rate_limits[rate_limit_type] = {"utilization": utilization,
+                                      "resets_at": resets_at}
+    try:
+        with open(_RATE_LIMIT_FILE, "w") as f:
+            f.write(json.dumps(_rate_limits))
+    except OSError:
+        pass
 
 
 def feed_waveform(pcm: np.ndarray):
