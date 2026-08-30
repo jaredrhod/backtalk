@@ -78,7 +78,7 @@ Speech recognition by [faster-whisper](https://github.com/SYSTRAN/faster-whisper
 
 ## Updating
 
-backtalk improves continuously (several of its best fixes came from this community within hours of being reported). To update, double-click the `Update` icon setup left on your Desktop, or run `./update.sh` (`update.bat` on Windows) in this folder: either shows you what changed before applying it. Saying **"pull the latest backtalk and tell me what changed"** to your agent works too. Your config, your keys, and your agent's identity live outside the tracked files, so updates never touch them. Installed through fullstack-agent? `./fullstack-agent/update.sh` updates every piece at once and prints what changed.
+backtalk improves continuously (several of its best fixes came from this community within hours of being reported). To update, double-click the `Update` icon if setup left one on your Desktop, or run `./update.sh` (`update.bat` on Windows) in this folder: either shows you what changed before applying it. Saying **"pull the latest backtalk and tell me what changed"** to your agent works too. Your config, your keys, and your agent's identity live outside the tracked files, so updates never touch them. Installed through fullstack-agent? `./fullstack-agent/update.sh` updates every piece at once and prints what changed.
 
 ## The rest of it
 
