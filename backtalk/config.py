@@ -183,6 +183,36 @@ DEFAULTS = {
                    "acompressor=threshold=-18dB:ratio=2.5:attack=8:"
                    "release=120:makeup=4dB,alimiter=limit=0.95"),
     },
+    # Optional premium voice: Fish Audio on YOUR key — including a voice
+    # you cloned yourself on fish.audio (reference_id below is your
+    # model's id). Streams raw PCM, so unlike ElevenLabs it needs NO
+    # ffmpeg. The key NEVER goes in a file: it's read from the macOS
+    # Keychain (item `backtalk-fish`) or Linux secret-tool, with the
+    # FISH_AUDIO_API_KEY env var as last-resort fallback — see
+    # mouth._get_fish_key for the seeding one-liners. Kokoro remains the
+    # automatic fallback, so the voice degrades instead of going mute if
+    # the cloud fails. If both fish and elevenlabs are enabled, fish
+    # answers first.
+    "fish": {
+        "enabled": False,
+        # Your voice model's id on fish.audio. Every account can clone a
+        # voice there; this is how your clone gets wired in.
+        "reference_id": "",
+        # Purely for you. Model ids are unreadable six months later, so put
+        # the human name here; nothing reads it.
+        "voice_note": "",
+        # The TTS generation, sent as the request's `model` header:
+        # "s2.1-pro-free" is the free tier and works on an unfunded
+        # account; "s1", "s2-pro", and "s2.1-pro" are paid and return
+        # 402 Payment Required until the account holds credits.
+        "model": "s2.1-pro-free",
+        # Which OS credential-store entry holds the key. Change it if you
+        # already keep a Fish Audio key under a name of your own.
+        "key_slot": "backtalk-fish",
+        # "low", "balanced", or "normal" — Fish Audio's own latency knob.
+        "latency": "balanced",
+        "sample_rate": 44100,
+    },
     # Where the signal-bus files are written (.voice_state,
     # .voice_waveform, .voice_loading_pid) — anything can watch them;
     # visualizers pair with this contract. Default: the repo root.
