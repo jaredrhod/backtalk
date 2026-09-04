@@ -54,15 +54,26 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
 import json
+import logging
 import queue
 import re
 import socket
 import sys
 import threading
 import time
+import warnings
+
+# Cosmetic-only noise from the ML libraries underneath (torch deprecation
+# notices, huggingface_hub's unauthenticated-request notice) that fires on
+# every launch regardless of anything actually being wrong. Silenced here,
+# once, before anything below triggers the lazy imports that print it.
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 from backtalk import signals
 from backtalk.brain import WarmBrain
+from backtalk.ollama_brain import OllamaBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -295,6 +306,96 @@ def make_permission_gate(mouth):
     return gate
 
 
+def _ollama_human_what(tool, args):
+    """_human_what's counterpart for the local brain's small, fixed
+    tool set — read-only, so there's no edit/Bash/WebFetch case to
+    cover."""
+    if tool == "read_file":
+        path = str(args.get("path", "")).replace("\\", "/")
+        name = path.rsplit("/", 1)[-1] or "a file"
+        return f"read a file called {name}"
+    if tool == "list_directory":
+        path = str(args.get("path", "")).replace("\\", "/")
+        name = path.rsplit("/", 1)[-1] or "a folder"
+        return f"look at what's inside a folder called {name}"
+    return f"use the {tool} tool"
+
+
+def _ollama_full_detail(tool, args):
+    if tool == "read_file":
+        return f"read the file {args.get('path', '')}"
+    if tool == "list_directory":
+        return f"list the folder {args.get('path', '')}"
+    return f"use {tool}"
+
+
+def make_ollama_permission_gate(mouth):
+    """The same spoken yes/no/details flow as make_permission_gate,
+    shrunk to the local brain's two read-only tools and returning a
+    plain bool instead of a Claude SDK result object — this brain's
+    tool loop (ollama_brain.ask_stream) isn't the Claude SDK, so there
+    are no PermissionResultAllow/Deny types to build here. Shares
+    _PERM/_AUTOAPPROVE/_YES/_DETAILS/_norm_speech with the Claude gate
+    above rather than keeping a second, divergent copy of that state."""
+    async def gate(tool: str, args: dict) -> bool:
+        if _AUTOAPPROVE["on"]:
+            return True
+        what = _ollama_human_what(tool, args)
+        detail = _ollama_full_detail(tool, args)
+        loop = asyncio.get_running_loop()
+        signals.static_stop()
+        log(f"[perm]   asking (local): {what}")
+        log(f"[perm]   detail: {detail}")
+        ask = f"Permission check. I want to {what}. Yes, no, or details?"
+        if not _PERM["hinted"]:
+            _PERM["hinted"] = True
+            ask += (" And any time you're done with these checks, say "
+                    "stop asking for permission.")
+        mouth.say(ask)
+        answer = None
+        try:
+            deadline = loop.time() + PERM_TIMEOUT_S
+            while answer is None:
+                fut = loop.create_future()
+                _PERM["fut"] = fut
+                _PERM["asked_at"] = time.monotonic()
+                while True:
+                    try:
+                        got = await asyncio.wait_for(
+                            asyncio.shield(fut), 1.0)
+                        break
+                    except asyncio.TimeoutError:
+                        if loop.time() >= deadline:
+                            fut.cancel()
+                            mouth.say("No answer, so I didn't do it.")
+                            log("[perm]   timed out, denied")
+                            return False
+                        if not mouth.speaking:
+                            signals.set_state("listening")
+                if (got != _INTERRUPT_ANSWER
+                        and _norm_speech(got) in _DETAILS):
+                    log("[perm]   details requested")
+                    mouth.say(f"The details: I want to {detail}. "
+                              "Yes or no?")
+                    deadline = loop.time() + PERM_TIMEOUT_S
+                    continue
+                answer = got
+        finally:
+            _PERM["fut"] = None
+        if answer == _INTERRUPT_ANSWER:
+            log("[perm]   turn interrupted, denied silently")
+            return False
+        approved = _norm_speech(answer) in _YES
+        signals.set_state("thinking")
+        signals.static_start()
+        if approved:
+            log("[perm]   approved by voice")
+        else:
+            log(f"[perm]   denied: {answer!r}")
+        return approved
+    return gate
+
+
 # ---- THE VOICE CONSOLE: session verbs, spoken. Exact phrases only,
 # spoken alone, so ordinary sentences can never trigger them. (Grown
 # from a community member's own build shared in the Discord.)
@@ -325,6 +426,18 @@ CONSOLE_VERBS = {
                   "auto approve mode"),
     "ask":       ("start asking again", "ask before acting",
                   "ask for permission again"),
+    "golocal":   ("switch to local model", "switch to the local model",
+                  "use local model", "use the local model",
+                  "switch to ollama", "switch to the ollama model",
+                  "use ollama", "local brain", "switch to local brain",
+                  "switch to the local brain", "go local"),
+    "gocloud":   ("switch to claude", "switch to the claude model",
+                  "switch to claude model", "use claude",
+                  "use the claude model", "back to claude",
+                  "back to the claude model", "cloud brain",
+                  "switch to cloud brain", "switch to the cloud brain",
+                  "switch to claude brain", "switch to the claude brain",
+                  "go claude", "go cloud"),
 }
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -667,6 +780,11 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+    # Both brains the voice console can switch between live ("switch to
+    # local model" / "switch to claude"). Ollama connects lazily, on
+    # first switch, so a session that never asks for it never pays the
+    # connectivity check.
+    _BRAINS = {"claude": brain, "ollama": None}
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -736,6 +854,7 @@ async def amain():
             signals.set_state("idle")
 
     async def _run_console_inner(verb):
+        nonlocal brain
         _deny_pending()
         await brain.reset_turn()
         say_after = None
@@ -747,14 +866,56 @@ async def amain():
             resp = await brain.command("/compact")
             say_after = "Compacted. Same conversation, smaller footprint."
         elif verb == "deep":
-            mouth.say("Switching to the deep model. Heads up, replies "
-                      "get slower. Say back to the fast model when "
-                      "you're done.")
-            resp = await brain.command(f"/model {CFG['deep_model']}")
-            say_after = "Deep model online, for this session only."
+            if isinstance(brain, OllamaBrain):
+                mouth.say("Switching to the bigger local model. Heads "
+                          "up, replies get slower.")
+                resp = await brain.command(
+                    f"/model {CFG['ollama_deep_model']}")
+                say_after = "Bigger local model online, for this session only."
+            else:
+                mouth.say("Switching to the deep model. Heads up, replies "
+                          "get slower. Say back to the fast model when "
+                          "you're done.")
+                resp = await brain.command(f"/model {CFG['deep_model']}")
+                say_after = "Deep model online, for this session only."
         elif verb == "fast":
-            resp = await brain.command(f"/model {CFG['model']}")
-            say_after = "Back on the fast model."
+            if isinstance(brain, OllamaBrain):
+                resp = await brain.command(f"/model {CFG['ollama_model']}")
+                say_after = "Back on the fast local model."
+            else:
+                resp = await brain.command(f"/model {CFG['model']}")
+                say_after = "Back on the fast model."
+        elif verb == "golocal":
+            resp = ""
+            if isinstance(brain, OllamaBrain):
+                mouth.say("Already on the local model.")
+            else:
+                mouth.say("Switching to your local model. Fully "
+                          "offline, no usage cost. It can read files "
+                          "and look in folders, always asking first, "
+                          "but it can't write, edit, or run commands. "
+                          "Say switch to claude for that.")
+                if _BRAINS["ollama"] is None:
+                    _BRAINS["ollama"] = OllamaBrain(
+                        permission_gate=make_ollama_permission_gate(mouth))
+                    try:
+                        await asyncio.wait_for(_BRAINS["ollama"].start(), 30)
+                    except Exception as e:
+                        _BRAINS["ollama"] = None
+                        log(f"[ollama] connect failed: {e!r}")
+                        mouth.say("Couldn't reach Ollama. Check that "
+                                  "it's running, then try again. "
+                                  "Staying on Claude.")
+                        signals.set_state("idle")
+                        return
+                brain = _BRAINS["ollama"]
+        elif verb == "gocloud":
+            resp = ""
+            if isinstance(brain, WarmBrain):
+                mouth.say("Already on Claude.")
+            else:
+                brain = _BRAINS["claude"]
+                mouth.say("Back on Claude. Full tool access again.")
         elif verb.startswith("effort:"):
             lvl = verb.split(":", 1)[1]
             resp = await brain.command(f"/effort {lvl}")
@@ -1058,7 +1219,12 @@ async def amain():
         mouth.shutdown()  # restores the music on Ctrl-C / crash paths too
         signals.static_stop()
         signals.set_state("idle")
-        await brain.stop()
+        for b in _BRAINS.values():   # both, if a session ever switched
+            if b is not None:
+                try:
+                    await b.stop()
+                except Exception:
+                    pass
         log("[backtalk] hung up")
 
 

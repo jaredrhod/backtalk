@@ -54,6 +54,17 @@ DEFAULTS = {
     # lasts one session and is always spoken; this default never moves
     # by itself.
     "deep_model": "claude-opus-5",
+    # A local Ollama brain, switchable live by voice ("switch to local
+    # model" / "switch to claude"). Runs fully offline on your own
+    # machine, no usage cost. Read-only tools (read a file, list a
+    # folder), each asked about out loud like Claude's tools -- no
+    # write/edit/shell access, that would need its own, more careful
+    # permission design. "fast"/"deep" apply to whichever brain is
+    # active: on Ollama they swap between these two model tags instead
+    # of the Claude tiers above.
+    "ollama_model": "qwen3.5:9b",
+    "ollama_deep_model": "qwen3.6:27b",
+    "ollama_url": "http://localhost:11434",
     # Tool permissions for the voice session. "ask" is the default ON
     # PURPOSE (safety is opt-out, never opt-in): when the agent wants a
     # gated tool (write a file, run a real command), it ASKS OUT LOUD
@@ -236,10 +247,13 @@ DISCIPLINE = (
     "again'. Microphone: 'go hands free', or 'push to talk mode'. "
     "Also: 'clear the session', 'compact the session', 'switch to "
     "the deep model', 'back to the fast model', 'set effort to low' "
-    "(or medium, high, max), and 'usage report'. You cannot flip "
-    "these live yourself, so when asked, give the person the exact "
-    "phrase to SAY. Editing backtalk.json only changes the default "
-    "for the NEXT launch."
+    "(or medium, high, max), 'usage report', 'switch to local model' "
+    "(runs a local Ollama model instead of you, fully offline, "
+    "read-only file access), and 'switch to claude' (back to you, "
+    "full read/write/command access). You cannot flip these live "
+    "yourself, so when "
+    "asked, give the person the exact phrase to SAY. Editing "
+    "backtalk.json only changes the default for the NEXT launch."
 )
 
 
