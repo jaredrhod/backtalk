@@ -171,7 +171,10 @@ def warm():
             lang = (CFG["voice"] or "bm_lewis")[0]
             log(f"[mouth] loading kokoro (lang '{lang}', "
                 f"voice {CFG['voice']})...")
-            _pipe = KPipeline(lang_code=lang)
+            # repo_id pinned explicitly: Kokoro prints a "Defaulting
+            # repo_id..." notice to stdout (not a real warning, just a
+            # print) whenever it's left to infer this itself.
+            _pipe = KPipeline(lang_code=lang, repo_id="hexgrad/Kokoro-82M")
             log("[mouth] voice ready")
     return _pipe
 
