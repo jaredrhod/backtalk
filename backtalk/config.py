@@ -131,6 +131,8 @@ DEFAULTS = {
     # language pipeline (a=American, b=British, e/f/h/i/j/p/z = other
     # languages), so keep voice and accent matched.
     "voice": "bm_lewis",
+    # Device for local Kokoro TTS pipeline: "cpu" (default) or "cuda"
+    "tts_device": "cpu",
     # Speech recognition (faster-whisper, local, free).
     # Models: tiny.en / base.en / small.en / medium.en — small.en is the
     # accuracy/speed sweet spot on a normal machine.

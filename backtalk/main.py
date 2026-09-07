@@ -679,7 +679,7 @@ async def amain():
     loop = asyncio.get_event_loop()
     # Warm the engines while the greeting plays: the STT model load and
     # the brain's prompt-cache toll both hide behind the spoken line.
-    loop.run_in_executor(None, warm_ears)
+    warm_ears_fut = loop.run_in_executor(None, warm_ears)
     # THE BRAIN CONNECT, guarded. This is the one startup step that
     # needs a signed-in Claude Code, internet, and available usage.
     # When it fails or hangs, the mouth still works, so SAY SO instead
@@ -707,6 +707,11 @@ async def amain():
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
+    try:
+        await asyncio.wait_for(asyncio.shield(warm_ears_fut), 60)
+        log("[backtalk] ears warm and ready")
+    except Exception as e:
+        log(f"[ears] warmup error: {e!r}")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken
