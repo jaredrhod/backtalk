@@ -289,12 +289,13 @@ def warm():
                                        verbose=None)
                 _model, _backend = repo, "mlx"
             else:
-                from faster_whisper import WhisperModel
                 want = CFG["stt_device"]
+                compute = CFG["stt_compute"]
                 log(f"[ears] loading {CFG['stt_model']} "
-                    f"({want}/{CFG['stt_compute']})...")
+                    f"({want}/{compute})...")
+                from faster_whisper import WhisperModel
                 _model = WhisperModel(CFG["stt_model"], device=want,
-                                      compute_type=CFG["stt_compute"])
+                                      compute_type=compute)
                 # PROVE the device before the greeting, not at the first
                 # spoken sentence. WhisperModel CONSTRUCTS perfectly well
                 # against a GPU it cannot actually use: "auto" picks CUDA
@@ -418,6 +419,12 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
             frames.append(block[:, 0].copy())
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
+    try:
+        from backtalk.signals import set_state
+        set_state("thinking")
+    except Exception:
+        pass
+    print("[ptt] transcribing...", flush=True)
     return transcribe(np.concatenate(frames))
 
 

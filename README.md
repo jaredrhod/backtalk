@@ -54,6 +54,22 @@ Two engines, and the setup wizard offers you both instead of quietly defaulting.
 
 **ElevenLabs, the natural one.** The human-sounding voice most people actually want, on your own API key. The free tier is enough to audition it; day-to-day talking runs on the paid starter plan. The wizard walks the whole thing with you: account, key into the keychain, then an audition of real voices through backtalk's own mouth until one fits. Want the exact voice from my videos? It's called **Tarquin** in the ElevenLabs voice library: search it by name and you're done hunting. Under the hood it is: set `elevenlabs.enabled` and your `voice_id` in the config, and have `ffmpeg` installed. **The key never goes in a file.** On macOS, seed it into the Keychain once with `security add-generic-password -a "$USER" -s backtalk-elevenlabs -T /usr/bin/security -w` (it prompts for the secret) and backtalk reads it from there. Linux: `secret-tool store --label backtalk service backtalk-elevenlabs`. The `ELEVENLABS_API_KEY` environment variable works as a last resort, but an export in a shell profile is a plaintext key on disk; the keychain is the grown-up path. Kokoro stays wired in as the automatic fallback, so if the cloud fails the voice degrades instead of going mute, and `logs/backtalk.log` records why.
 
+## Local AI Brain (Optional)
+
+While backtalk defaults to Claude Code via the Agent SDK, it also supports local OpenAI-compatible inference servers (such as `llama-server`, Ollama, vLLM, or Aphrodite) for a 100% offline, private voice assistant.
+
+To switch to a local model, set `"brain": "local"` in your `backtalk.json`:
+
+```json
+{
+  "brain": "local",
+  "api_base": "http://127.0.0.1:8080/v1",
+  "model": "default"
+}
+```
+
+The local brain maintains multi-step tool execution (recursive directory inspection, file reading, command execution, and web browsing) and streams partial sentences directly to the voice pipeline with sentence boundary chunking. See `backtalk.local.json.example`.
+
 ## Give it a face (optional)
 
 backtalk writes tiny state files while it listens, thinks, and speaks, so anything can watch them and react in real time.

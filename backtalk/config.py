@@ -42,7 +42,13 @@ DEFAULTS = {
     # Display name, used in logs and to build the quit phrases
     # ("goodbye <name>" hangs up). Match your agent's actual name.
     "name": "Assistant",
-    # The brain. Full model id ON PURPOSE — never a bare alias like
+    # The brain backend: "claude" (default, uses Claude Agent SDK) or
+    # "local" (connects to an OpenAI-compatible endpoint such as llama-server,
+    # Ollama, vLLM, Aphrodite, etc.).
+    "brain": "claude",
+    # Endpoint base URL for local OpenAI-compatible brain.
+    "api_base": "http://127.0.0.1:8080/v1",
+    # The brain model. When using "claude", specify full model id on purpose
     # "sonnet": the SDK resolves aliases through its own bundled CLI and
     # can silently land on an older model. The fast tier is most of the
     # speed difference people ask about; a deep-work model makes every
@@ -131,6 +137,8 @@ DEFAULTS = {
     # language pipeline (a=American, b=British, e/f/h/i/j/p/z = other
     # languages), so keep voice and accent matched.
     "voice": "bm_lewis",
+    # Device for local Kokoro TTS pipeline: "cpu" (default) or "cuda"
+    "tts_device": "cpu",
     # Speech recognition (faster-whisper, local, free).
     # Models: tiny.en / base.en / small.en / medium.en — small.en is the
     # accuracy/speed sweet spot on a normal machine.

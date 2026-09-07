@@ -1,0 +1,13 @@
+{
+  "brain": "local",
+  "api_base": "http://127.0.0.1:8080/v1",
+  "model": "default",
+  "agent_dir": "~",
+  "name": "Assistant",
+  "ptt_key": "home",
+  "voice": "bm_lewis",
+  "tts_device": "cpu",
+  "stt_model": "small.en",
+  "stt_device": "auto",
+  "extra_dirs": []
+}
