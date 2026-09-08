@@ -24,16 +24,57 @@ only printed to a terminal window nobody saved. Every load-bearing line
 through log() so the next gremlin comes with receipts.
 """
 import datetime
+import sys
 from pathlib import Path
 
 LOG_PATH = Path(__file__).resolve().parent.parent / "logs" / "backtalk.log"
 
 
+def _init_console():
+    """Ask a Windows console for UTF-8 before anything is printed at it.
+
+    Windows consoles default to a legacy codepage (cp1252 on a UK/US
+    install), so a UTF-8 em-dash arrives as mojibake: the startup banner
+    rendered as "[backtalk] up a<TM>" instead of "up --". Fixing the
+    banner's own characters would not have been a fix, because the
+    agent's REPLIES are printed here too and can contain anything at all.
+
+    errors="replace" on the streams means a character the terminal
+    genuinely cannot draw degrades to "?" rather than raising mid
+    sentence and taking the voice down. No-ops everywhere but Windows.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_init_console()
+
+
 def log(line: str):
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        # Last resort if the console refused UTF-8: readable beats fatal.
+        print(line.encode("ascii", "replace").decode("ascii"), flush=True)
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with LOG_PATH.open("a") as f:
+        # encoding pinned on purpose. The default is the platform's, which
+        # on Windows is that same legacy codepage -- so the log file kept
+        # its own permanently corrupted copy of every line the console had
+        # already mangled, and the receipts this module exists to produce
+        # were unreadable exactly where they were most needed.
+        with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
     except Exception:
         pass  # a broken log file must never take the voice down

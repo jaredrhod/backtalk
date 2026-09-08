@@ -28,12 +28,23 @@ on_press events CONTINUOUSLY while a key is held. Without the held-state
 filter below, every repeat reads as a fresh press and keeps cancelling
 the reply before it can speak.
 
+AND THE HALF THAT TRAP HIDES: some keyboards send auto-repeat as full
+DOWN/UP PAIRS rather than the repeated DOWN-only stream. Filtering the
+presses and trusting every release then breaks the OTHER way -- a single
+hold is chopped into dozens of ~50ms recordings, each too short to
+transcribe, and the whole thing is SILENT. No exception, no log line,
+nothing to search for; it simply reads as "the microphone does not work".
+Measured in the field on a Logitech MX Mechanical through a Bolt
+receiver: one 2.6-second hold produced 186 key events and about fifty
+recordings. So a release is never trusted on sight -- see is_held().
+
 macOS needs Input Monitoring permission for the hosting terminal
 (System Settings -> Privacy & Security -> Input Monitoring). Windows
 works out of the box; some Linux desktops need the user in the `input`
 group or an X11 session.
 """
 import threading
+import time
 
 from pynput import keyboard
 
@@ -64,9 +75,16 @@ def resolve_key(name: str):
 
 
 class PTTListener:
+    # How long a release must stand unchallenged before it is believed.
+    # Comfortably longer than any keyboard's auto-repeat period (measured
+    # at ~50ms on the hardware that exposed this; Windows' fastest setting
+    # is ~30ms) and short enough that letting go still feels instant.
+    RELEASE_GRACE = 0.12
+
     def __init__(self, key="home"):
         self._key = resolve_key(key) if isinstance(key, str) else key
         self._held = False
+        self._release_t = None          # a release awaiting confirmation
         self._press_evt = threading.Event()
         self._listener = keyboard.Listener(on_press=self._on_press,
                                            on_release=self._on_release)
@@ -74,18 +92,40 @@ class PTTListener:
         self._listener.start()
 
     def _on_press(self, k):
-        if k == self._key and not self._held:   # filter key-repeat
+        if k != self._key:
+            return
+        # A press cancels any pending release: that release was auto-repeat,
+        # not a human letting go.
+        self._release_t = None
+        if not self._held:                      # filter key-repeat
             self._held = True
             self._press_evt.set()
 
     def _on_release(self, k):
         if k == self._key:
+            # PROVISIONAL. Believed only if no press follows; see _settle().
+            self._release_t = time.monotonic()
+
+    def _settle(self):
+        """Commit a release that has stood unchallenged for the grace window."""
+        r = self._release_t
+        if self._held and r is not None and \
+                time.monotonic() - r >= self.RELEASE_GRACE:
             self._held = False
+            self._release_t = None
 
     def wait_press(self):
         """Block until the key goes DOWN (one event per physical press)."""
-        self._press_evt.wait()
-        self._press_evt.clear()
+        # Settled on a loop, not once. A release landing after the last
+        # is_held() poll leaves _held provisionally True, and a single
+        # settle-then-wait would then block forever: the next press is
+        # filtered as key-repeat, so nothing ever sets the event again.
+        while True:
+            self._settle()
+            if self._press_evt.wait(timeout=self.RELEASE_GRACE):
+                self._press_evt.clear()
+                return
 
     def is_held(self) -> bool:
+        self._settle()
         return self._held

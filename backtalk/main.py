@@ -56,6 +56,7 @@ import asyncio
 import json
 import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -63,7 +64,8 @@ import time
 from backtalk import signals
 from backtalk.brain import WarmBrain
 from backtalk.config import CFG
-from backtalk.ears import Ears, record_held, warm as warm_ears
+from backtalk.ears import (Ears, explain_audio_failure, record_held,
+                           warm as warm_ears)
 from backtalk.mouth import Mouth
 from backtalk.ptt import PTTListener
 from backtalk.vlog import log
@@ -107,9 +109,18 @@ _MIC = {"mode": "ptt", "gen": 0, "btn": False}
 # "yesterday", "yes or no", and "yes, but do not overwrite" must all
 # fail. Anything that is not an exact yes DENIES, with the words passed
 # back to the agent as the reason. Deny is always the default.
+# Exact matches only, and the reason is in the comment on _norm_speech:
+# prefix matching turns "yesterday" and "yes or no" into consent. So the
+# set has to actually CONTAIN what people say -- and the phrase somebody
+# reaches for is the one the prompt just put in their head. Asking for
+# PERMISSION and then denying "permission granted" is the system tripping
+# a user with its own vocabulary, and it quotes their words back as the
+# reason for the refusal.
 _YES = {"yes", "yeah", "yep", "yup", "sure", "approve", "approved",
         "go ahead", "do it", "yes please", "yes sir", "yes boss",
-        "yes go ahead", "go for it", "green light", "okay", "ok", "y"}
+        "yes go ahead", "go for it", "green light", "okay", "ok", "y",
+        "permission granted", "granted", "you have permission",
+        "you may", "allowed", "allow it", "confirmed", "affirmative"}
 _CHAIN_MARKS = ("&&", "||", ";", "|", "$(", "`", "\n")
 
 
@@ -978,7 +989,8 @@ async def amain():
                 except Exception as e:
                     mic_fut = None
                     mic_fails += 1
-                    log(f"[ears] open mic failed ({mic_fails}): {e!r}")
+                    if not explain_audio_failure(e):
+                        log(f"[ears] open mic failed ({mic_fails}): {e!r}")
                     if mic_fails >= 3:
                         _MIC["mode"] = "ptt"
                         _MIC["gen"] += 1
@@ -1014,9 +1026,19 @@ async def amain():
                     text = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
                 except Exception as e:
-                    log(f"[ears] record/transcribe failed: {e!r}")
-                    mouth.say("My ears hit an error. Check this "
-                              "window for the details.")
+                    # A device-level failure gets plain words instead of a
+                    # raw exception. The pre-flight at startup cannot catch
+                    # a microphone unplugged mid-session, and that is the
+                    # case where the old message was worst: jargon, on
+                    # every press, with the key hook still working so it
+                    # looked like it was listening.
+                    if explain_audio_failure(e):
+                        mouth.say("I can't hear you. There's no working "
+                                  "microphone I can use.")
+                    else:
+                        log(f"[ears] record/transcribe failed: {e!r}")
+                        mouth.say("My ears hit an error. Check this "
+                                  "window for the details.")
                     text = None
                 finally:
                     _MIC["btn"] = False
@@ -1040,7 +1062,51 @@ async def amain():
         log("[backtalk] hung up")
 
 
+# Loopback port used purely as a mutex. Nothing is ever served on it.
+_INSTANCE_PORT = 8791
+_instance_lock = None
+
+
+def _claim_single_instance() -> bool:
+    """Refuse to be the second voice line on this machine, out loud.
+
+    Two instances both hold the keyboard hook and both open the
+    microphone, and the result looks EXACTLY like a broken talk key:
+    presses register, the audio goes to whichever process won the
+    device, and the loser reports an ignored tap. Nothing warned about
+    it, so a user who double-clicks the Talk icon twice concludes the
+    product is broken. The tell, when it was finally caught, was the
+    same sentence transcribed twice at an identical timestamp.
+
+    A bound socket is the mutex rather than a pid file, because the
+    operating system releases it when this process dies HOWEVER it dies.
+    A pid file outlives a crash or a force-kill and then lies about a
+    process that is long gone, which is the failure it would exist to
+    prevent.
+    """
+    global _instance_lock
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # No SO_REUSEADDR here on purpose: reuse is exactly what would let a
+    # second instance bind alongside the first and defeat the whole point.
+    try:
+        s.bind(("127.0.0.1", _INSTANCE_PORT))
+        s.listen(1)
+    except OSError:
+        s.close()
+        return False
+    _instance_lock = s
+    return True
+
+
 def main():
+    if not _claim_single_instance():
+        print("[backtalk] ANOTHER VOICE LINE IS ALREADY RUNNING on this "
+              "machine, so this one is stopping.", flush=True)
+        print("[backtalk] Two of them fight over the microphone and the "
+              "talk key, which looks exactly like the talk key being "
+              "broken. Use the window that is already open, or close it "
+              "and start again.", flush=True)
+        sys.exit(1)
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:

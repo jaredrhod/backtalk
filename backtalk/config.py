@@ -115,6 +115,12 @@ DEFAULTS = {
     # A resume that fails falls back to a fresh session and says so in
     # the log. (Grew out of the same community proposal, issue #1.)
     "resume_last_session": False,
+    # Publish your Claude usage (the five-hour and weekly windows) on the
+    # signal bus so a face can draw it. OFF by default and deliberately
+    # so: this is your own account spend, and the faces this feeds are
+    # frequently on a stream or a shared screen. Nothing is collected at
+    # all while this is false. (Community fix, ai-visualizer issue #1.)
+    "show_usage": False,
     # Reasoning effort for the voice session: "" inherits the model's
     # default; "low" / "medium" / "high" / "max" applies at launch.
     # Saying "set effort to X" in a voice session saves itself here.
@@ -132,6 +138,23 @@ DEFAULTS = {
     # "auto" uses CUDA when present, otherwise CPU. int8 keeps CPU fast.
     "stt_device": "auto",
     "stt_compute": "int8",
+    # The microphone to record from, matched by NAME. "" means whatever
+    # the OS calls the default input, which is right on most machines.
+    #
+    # Set a real device name to PIN the mic, so a headset connecting for
+    # OUTPUT cannot steal your input -- which also keeps a Bluetooth
+    # headset in high-quality A2DP instead of dropping it to the
+    # narrowband call profile mid-sentence, degrading what you hear at
+    # the same moment it takes your voice.
+    #
+    # A name and never an index: indices shift every time a device
+    # connects or disconnects, the exact event this setting exists to
+    # survive. Exact name wins, then the first case-insensitive
+    # substring. A name matching nothing falls back to the default and
+    # logs the inputs it did find; the mic degrades, it never goes mute.
+    #
+    # NOT "stt_device" below, which is the Whisper COMPUTE device.
+    "mic_device": "",
     # Optional premium voice: ElevenLabs on YOUR key. The key NEVER
     # goes in a file: it's read from the macOS Keychain (item
     # `backtalk-elevenlabs`) or Linux secret-tool, with the

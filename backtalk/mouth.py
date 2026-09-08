@@ -42,7 +42,9 @@ slow-motion garble.
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 
 import numpy as np
@@ -80,6 +82,78 @@ def _ensure_espeak():
             break
 
 
+# Every espeak library filename phonemizer might copy, on any platform. A
+# directory holding exactly one of these and nothing else is a phonemizer
+# scratch dir and is not plausibly anything else.
+_ESPEAK_LIB_NAMES = (
+    "espeak-ng.dll",
+    "libespeak-ng.dll",
+    "libespeak-ng.so",
+    "libespeak-ng.so.1",
+    "libespeak-ng.dylib",
+)
+
+
+def _is_orphan_espeak_tempdir(path: str) -> bool:
+    """True only for a directory whose ENTIRE contents are one espeak
+    library. That signature is what makes it safe to point a delete at a
+    shared temp folder: one file, and its name is one of five."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    return len(entries) == 1 and entries[0] in _ESPEAK_LIB_NAMES
+
+
+def _sweep_orphan_espeak_tempdirs():
+    """Delete espeak scratch dirs left behind by previous runs.
+
+    phonemizer copies the espeak shared library into a fresh temp dir for
+    every backend it builds, because espeak-ng keeps its state in globals
+    and the loader refuses the same file twice. Kokoro builds several
+    backends, so ONE start leaves several behind.
+
+    On POSIX that cleanup rides a finalizer and usually happens. On
+    Windows phonemizer can only register it with atexit, and atexit does
+    not run when a process is KILLED rather than exited -- so anything
+    stopping the voice line by terminating it, which is most launchers and
+    every supervisor, leaks every directory it ever made. Sixty had piled
+    up on the machine where this was found, and fifteen were sitting on
+    the author's own Mac when it was reviewed: the POSIX path is not as
+    reliable as it looks either. The count only ever grows.
+
+    Patching phonemizer where it is installed is not a fix, because the
+    launcher runs a dependency sync that would overwrite it. Sweeping at
+    our own startup bounds the total at one run's worth instead.
+
+    Two things make deleting from a shared temp folder safe, and only the
+    first is ours: the signature above is narrow enough that nothing else
+    matches it, and anything we are not permitted to remove raises and is
+    skipped. On Windows a loaded library cannot be deleted at all, so a
+    live instance is protected by the OS rather than by us noticing it.
+    POSIX does not work that way, but a process that has already mapped
+    the library keeps it after the unlink, so a running instance is
+    unharmed either way.
+    """
+    root = tempfile.gettempdir()
+    swept = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(root, name)
+        if not os.path.isdir(path) or not _is_orphan_espeak_tempdir(path):
+            continue
+        try:
+            shutil.rmtree(path)
+            swept += 1
+        except OSError:
+            pass          # in use, or not ours. Leaving it is correct.
+    if swept:
+        log(f"[mouth] swept {swept} orphaned espeak temp dir(s)")
+
+
 def warm():
     """Load the Kokoro pipeline (first call downloads the model to the
     HF cache). Called at startup while the greeting text is composed."""
@@ -87,6 +161,9 @@ def warm():
     with _pipe_lock:
         if _pipe is None:
             _ensure_espeak()
+            # Before kokoro makes this run's scratch dirs, clear the ones
+            # earlier runs could not clean up on their way out.
+            _sweep_orphan_espeak_tempdirs()
             from kokoro import KPipeline
             # The voice name's first letter IS the language pipeline:
             # a=American English, b=British English, e/f/h/i/j/p/z = the
@@ -344,9 +421,19 @@ class Mouth:
         sample rate changes (ElevenLabs 44.1k <-> Kokoro 24k fallback:
         rare, costs at most one blip on the switch)."""
         if self._out is not None and self._out_rate == rate:
-            if not self._out.active:
-                self._out.start()
-            return self._out
+            # Guarded, because the stream can die UNDER us: the ears
+            # rebuild the whole audio system to recover from a device
+            # change (see ears._reopen_after_device_change), and that
+            # closes every open stream including this one. Touching a
+            # dead stream raises rather than returning False, so the
+            # check has to be the try, not an `if`. Falling through
+            # rebuilds it, which is what the rest of this method does.
+            try:
+                if not self._out.active:
+                    self._out.start()
+                return self._out
+            except Exception:
+                log("[mouth] the output stream went away, reopening")
         self._drop_out()
         self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
         self._out_rate = rate

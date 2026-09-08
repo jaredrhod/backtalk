@@ -170,25 +170,49 @@ class WarmBrain:
             pass
 
     async def _pull_rate_limits(self):
-        """Pull real 5h/7d usage straight from the CLI's own `get_usage`
-        control request — a direct query, not the sparse RateLimitEvent
-        stream (which fires rarely and often omits utilization entirely).
-        Must never break a turn; silence on any failure."""
+        """Ask the CLI outright how much of the plan is spent.
+
+        A DIRECT QUERY, not the RateLimitEvent stream. The event fires
+        rarely and usually arrives carrying resets_at with no utilization
+        at all, so a listener built on it reports nothing most of the
+        time -- which is exactly how this feature looked broken for its
+        whole life. (Community fix, ai-visualizer issue #1.)
+
+        THIS REACHES PAST THE SDK'S PUBLIC SURFACE ON PURPOSE, and a
+        reader should know it rather than discover it. `get_usage` is a
+        control request the bundled CLI answers but the SDK never wraps,
+        so there is no supported call to make. The supported-looking
+        alternative is a dead end and was tested as one: the terminal
+        status line never fires in a headless session, so its numbers
+        are unreachable from here.
+
+        Which means this can stop working without anyone doing anything
+        wrong, and the containment is the point. Every failure is
+        swallowed and the readout simply goes quiet. It must never cost
+        a turn, so it is also bounded -- an unanswered control request
+        would otherwise hang the voice line mid-conversation."""
+        if not CFG.get("show_usage"):
+            return
         try:
-            usage = await self._client._query._send_control_request(
-                {"subtype": "get_usage"})
-            rl = usage.get("rate_limits") or {}
+            usage = await asyncio.wait_for(
+                self._client._query._send_control_request(
+                    {"subtype": "get_usage"}), 5)
             for window in ("five_hour", "seven_day"):
-                w = rl.get(window)
+                w = (usage.get("rate_limits") or {}).get(window)
                 if not w:
                     continue
-                util = w.get("utilization")
-                util = util / 100 if util is not None else None
-                resets_at = w.get("resets_at")
-                if resets_at:
-                    resets_at = int(datetime.fromisoformat(resets_at)
-                                     .timestamp())
-                signals.set_rate_limit(window, util, resets_at)
+                # Two spellings accepted deliberately: this shape is not
+                # documented anywhere, so the cheap tolerance is worth
+                # more than the tidiness. Both are percentages, and the
+                # rest of the pipeline wants a 0..1 fraction.
+                pct = w.get("utilization")
+                if pct is None:
+                    pct = w.get("used_percentage")
+                pct = pct / 100 if pct is not None else None
+                resets = w.get("resets_at")
+                if isinstance(resets, str):
+                    resets = int(datetime.fromisoformat(resets).timestamp())
+                signals.set_rate_limit(window, pct, resets)
         except Exception:
             pass
 
