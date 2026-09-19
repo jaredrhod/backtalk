@@ -579,10 +579,13 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
+                      release_ts: float | None = None):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). release_ts, when given, is the PTT
+    release moment — it rides along to the first chunk only, so mouth.py
+    can log the full release-to-audio round trip."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -606,9 +609,10 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if not s:
             return
         if first:
+            log(f"[bench] brain: {time.time()-t0:.2f}s to first sentence")
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mouth.say_chunk(s, pending, release_ts=release_ts)
             pending = []
             first = False
         else:
@@ -856,10 +860,13 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     release_ts: float | None = None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        release_ts is when it ENDED (the PTT release, PTT-mode only) —
+        the start line for full round-trip latency benchmarking."""
         nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
@@ -933,7 +940,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain, mouth, text, release_ts=release_ts))
         return True
 
     try:
@@ -1022,8 +1030,9 @@ async def amain():
                 mouth.ducker.speech_start()      # duck NOW, while you talk
                 print("[ptt] recording (release to send)...", flush=True)
                 _MIC["btn"] = True               # open mic yields to the button
+                release_ts = None
                 try:
-                    text = await loop.run_in_executor(
+                    text, release_ts = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
@@ -1047,7 +1056,8 @@ async def amain():
                     log("[ptt] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text, spoke_from=press_t):
+                if not await handle(text, spoke_from=press_t,
+                                    release_ts=release_ts):
                     return
     except KeyboardInterrupt:
         pass

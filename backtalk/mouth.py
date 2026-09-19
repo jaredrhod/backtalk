@@ -46,6 +46,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -353,19 +354,23 @@ class Mouth:
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put((s, None))
+            self._q.put((s, None, None))
 
-    def say_chunk(self, text: str, directions=None):
+    def say_chunk(self, text: str, directions=None, release_ts=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
         chunks get livelier prosody (single short sentences come out
         dull).
 
         `directions` are the stage directions this chunk carried. They are
         published on the signal bus when this chunk's audio STARTS, which
-        is why they travel with it instead of firing at parse time."""
+        is why they travel with it instead of firing at parse time.
+
+        `release_ts`, when given, is the PTT-release moment for the turn
+        this chunk answers — carried only by a reply's first chunk, so
+        _play_stream can log the full release-to-audio round trip."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None))
+            self._q.put((text, directions or None, release_ts))
 
     def shut_up(self):
         """Barge-in: stop current playback and flush everything queued."""
@@ -384,7 +389,6 @@ class Mouth:
 
     def wait_done(self, timeout: float | None = None):
         """Block until the queue is drained and playback finished."""
-        import time
         deadline = None if timeout is None else time.time() + timeout
         while (not self._q.empty()) or self._speaking.is_set():
             time.sleep(0.05)
@@ -395,7 +399,8 @@ class Mouth:
         from backtalk import signals
         while True:
             item = self._q.get()
-            sentence, directions = item if isinstance(item, tuple) else (item, None)
+            sentence, directions, release_ts = (
+                item if isinstance(item, tuple) else (item, None, None))
             if not sentence:
                 continue
             self._stop.clear()
@@ -404,7 +409,7 @@ class Mouth:
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions)
+                self._play_stream(sentence, directions, release_ts)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -465,12 +470,13 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, directions=None, block: int = 2205,
-                     prebuffer_s: float = 0.75):
+    def _play_stream(self, sentence: str, directions=None, release_ts=None,
+                     block: int = 2205, prebuffer_s: float = 0.75):
         """Stream-synthesize and play with the head-start buffer (audio
         law #2). stop() reacts ~50ms. The sample rate comes from
         whichever engine actually answered."""
         from backtalk import signals
+        t_synth_start = time.time()
         gen = synth_stream(sentence)
         head: list = []
         banked = 0
@@ -488,6 +494,11 @@ class Mouth:
             # AUDIO STARTS HERE: the head buffer is full and the first write
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
+            t_audio = time.time()
+            log(f"[bench] tts:   {t_audio - t_synth_start:.2f}s")
+            if release_ts is not None:
+                log(f"[bench] total: {t_audio - release_ts:.2f}s "
+                    f"(release to audio)")
             if directions:
                 from backtalk import signals as _sig
                 _sig.direction(directions)
