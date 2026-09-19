@@ -351,6 +351,11 @@ class Mouth:
         # playback worker must not read that as "reply is over" — see the
         # comment in _run.
         self._synth_busy = threading.Event()
+        # When the last chunk's audio finished playing — the reference
+        # point for the [bench] gap line, the real dead-air-between-chunks
+        # number. None means "nothing to compare against yet" (start of a
+        # reply, or right after a barge-in).
+        self._last_chunk_end: float | None = None
         # The one persistent output stream (audio law #1).
         # Playback-worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
@@ -390,6 +395,7 @@ class Mouth:
         """Barge-in: stop current playback and flush everything queued,
         synthesized or not."""
         self._stop.set()
+        self._last_chunk_end = None   # the next chunk played is a new turn
         try:
             while True:
                 self._text_q.get_nowait()
@@ -452,6 +458,11 @@ class Mouth:
                         break
                 if rate is None or self._stop.is_set():
                     continue  # interrupted mid-synthesis — belongs to a dead turn
+                # Real synthesis cost, measured here and not in _play_ready:
+                # the wait for a free prefetch slot below can last as long
+                # as the PREVIOUS chunk is still playing, and that wait is
+                # not synthesis time.
+                log(f"[bench] synth: {time.time() - t_synth_start:.2f}s")
                 # A plain blocking put() here would be a real race: if the
                 # prefetch slot is full (playback still on the prior chunk)
                 # and a barge-in lands right now, shut_up()'s drain frees
@@ -462,8 +473,8 @@ class Mouth:
                 while not self._stop.is_set():
                     try:
                         self._audio_q.put(
-                            (rate, head, gen, directions, release_ts,
-                             t_synth_start), timeout=0.05)
+                            (rate, head, gen, directions, release_ts),
+                            timeout=0.05)
                         break
                     except queue.Full:
                         continue
@@ -476,15 +487,13 @@ class Mouth:
         stall the next chunk's synthesis."""
         from backtalk import signals
         while True:
-            rate, head, gen, directions, release_ts, t_synth_start = \
-                self._audio_q.get()
+            rate, head, gen, directions, release_ts = self._audio_q.get()
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_ready(rate, head, gen, directions, release_ts,
-                                 t_synth_start)
+                self._play_ready(rate, head, gen, directions, release_ts)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
@@ -551,7 +560,7 @@ class Mouth:
         self._out_rate = None
 
     def _play_ready(self, rate, head, gen, directions=None, release_ts=None,
-                    t_synth_start=None, block: int = 2205):
+                    block: int = 2205):
         """Play audio the synth worker already produced (head-start buffer
         plus the rest of its generator — audio law #2). stop() reacts
         ~50ms. Never synthesizes; that happens on the OTHER thread, one
@@ -563,7 +572,13 @@ class Mouth:
             # is next. Publishing now is what puts a screen cue on the spoken
             # word rather than seconds ahead of it.
             t_audio = time.time()
-            log(f"[bench] tts:   {t_audio - t_synth_start:.2f}s")
+            # The real answer to "is the pipeline actually closing the
+            # gap": dead air since the PREVIOUS chunk stopped playing.
+            # None for a reply's first chunk (nothing to compare against)
+            # and right after a barge-in (shut_up() clears it).
+            if self._last_chunk_end is not None:
+                log(f"[bench] gap:   {t_audio - self._last_chunk_end:.2f}s "
+                    f"(dead air since previous chunk)")
             if release_ts is not None:
                 log(f"[bench] total: {t_audio - release_ts:.2f}s "
                     f"(release to audio)")
@@ -591,6 +606,10 @@ class Mouth:
                 if not _write(pcm):
                     self._cut()
                     return
+            # Finished naturally (not cut short by a barge-in) — this is
+            # the reference point the NEXT chunk's [bench] gap line
+            # measures against.
+            self._last_chunk_end = time.time()
         except Exception:
             self._drop_out()
             raise
