@@ -336,14 +336,28 @@ def synth_stream(text: str, timeout: float = 30.0):
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
-        self._q: queue.Queue = queue.Queue()
+        self._text_q: queue.Queue = queue.Queue()
+        # Depth-1 prefetch: the synth worker is allowed exactly one chunk
+        # ahead of playback, no more. That is enough to close the gap
+        # between chunks (synthesis of the next one overlaps the current
+        # one's playback) without racing arbitrarily far ahead of a
+        # barge-in.
+        self._audio_q: queue.Queue = queue.Queue(maxsize=1)
         self._stop = threading.Event()
         self._speaking = threading.Event()
+        # Set for the span between the synth worker taking a text item off
+        # the queue and it landing in _audio_q. Both queues can be
+        # legitimately empty while this is set (mid-synthesis), and the
+        # playback worker must not read that as "reply is over" — see the
+        # comment in _run.
+        self._synth_busy = threading.Event()
         # The one persistent output stream (audio law #1).
-        # Worker-thread-only — never touch from other threads.
+        # Playback-worker-thread-only — never touch from other threads.
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        self._synth_worker = threading.Thread(target=self._synth_run, daemon=True)
+        self._synth_worker.start()
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -354,7 +368,7 @@ class Mouth:
     def say(self, text: str):
         """Queue text (split to sentences) for speech."""
         for s in split_sentences(text):
-            self._q.put((s, None, None))
+            self._text_q.put((s, None, None))
 
     def say_chunk(self, text: str, directions=None, release_ts=None):
         """Queue text as ONE TTS request, no sentence splitting — fuller
@@ -367,17 +381,23 @@ class Mouth:
 
         `release_ts`, when given, is the PTT-release moment for the turn
         this chunk answers — carried only by a reply's first chunk, so
-        _play_stream can log the full release-to-audio round trip."""
+        _play_ready can log the full release-to-audio round trip."""
         text = text.strip()
         if text:
-            self._q.put((text, directions or None, release_ts))
+            self._text_q.put((text, directions or None, release_ts))
 
     def shut_up(self):
-        """Barge-in: stop current playback and flush everything queued."""
+        """Barge-in: stop current playback and flush everything queued,
+        synthesized or not."""
         self._stop.set()
         try:
             while True:
-                self._q.get_nowait()
+                self._text_q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                self._audio_q.get_nowait()
         except queue.Empty:
             pass
 
@@ -388,32 +408,92 @@ class Mouth:
         self.ducker.restore_now()
 
     def wait_done(self, timeout: float | None = None):
-        """Block until the queue is drained and playback finished."""
+        """Block until both queues are drained and playback finished."""
         deadline = None if timeout is None else time.time() + timeout
-        while (not self._q.empty()) or self._speaking.is_set():
+        while (not self._text_q.empty()) or (not self._audio_q.empty()) \
+                or self._synth_busy.is_set() or self._speaking.is_set():
             time.sleep(0.05)
             if deadline and time.time() > deadline:
                 return
 
-    def _run(self):
-        from backtalk import signals
+    def _synth_run(self):
+        """Producer: turns queued text into ready-to-play audio, one chunk
+        ahead of playback. Runs on its own thread so synthesis of the NEXT
+        chunk overlaps playback of the CURRENT one instead of starting
+        only after it ends — that dead gap between chunks was the whole
+        point of splitting this off."""
         while True:
-            item = self._q.get()
+            item = self._text_q.get()
             sentence, directions, release_ts = (
                 item if isinstance(item, tuple) else (item, None, None))
             if not sentence:
                 continue
+            # A freshly dequeued item always starts clean: this is what
+            # lets a new turn's first chunk synthesize even though the
+            # PREVIOUS turn's barge-in left _stop set (mirrors where the
+            # old single-threaded loop cleared it, just moved to the
+            # producer side now that there is one).
             self._stop.clear()
+            self._synth_busy.set()
+            try:
+                t_synth_start = time.time()
+                gen = synth_stream(sentence)
+                head: list = []
+                banked = 0
+                rate = None
+                prebuffer_s = 0.75
+                for rate_, pcm in gen:
+                    if self._stop.is_set():
+                        break
+                    rate = rate_
+                    head.append(pcm)
+                    banked += len(pcm)
+                    if banked >= int(rate * prebuffer_s):
+                        break
+                if rate is None or self._stop.is_set():
+                    continue  # interrupted mid-synthesis — belongs to a dead turn
+                # A plain blocking put() here would be a real race: if the
+                # prefetch slot is full (playback still on the prior chunk)
+                # and a barge-in lands right now, shut_up()'s drain frees
+                # the slot and an unconditional put() would land this
+                # already-cancelled chunk right after the drain, where
+                # nothing catches it. Poll with the stop flag instead —
+                # same ~50ms reaction budget _write already promises.
+                while not self._stop.is_set():
+                    try:
+                        self._audio_q.put(
+                            (rate, head, gen, directions, release_ts,
+                             t_synth_start), timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
+            finally:
+                self._synth_busy.clear()
+
+    def _run(self):
+        """Consumer: plays whatever the synth worker hands it. Never
+        touches synth_stream() itself, so a slow or blocked player can't
+        stall the next chunk's synthesis."""
+        from backtalk import signals
+        while True:
+            rate, head, gen, directions, release_ts, t_synth_start = \
+                self._audio_q.get()
             self._speaking.set()
             self.ducker.speech_start()
             signals.static_stop()     # thinking sound dies when speech starts
             signals.set_state("speaking")
             try:
-                self._play_stream(sentence, directions, release_ts)
+                self._play_ready(rate, head, gen, directions, release_ts,
+                                 t_synth_start)
             except Exception as e:
                 log(f"[mouth] synth/play error: {e}")
             finally:
-                if self._q.empty():
+                # Both queues can be empty between chunks of the SAME
+                # reply, the instant one has been played and the next is
+                # still mid-synthesis — _synth_busy is what tells the two
+                # apart from the reply genuinely being over.
+                if self._text_q.empty() and self._audio_q.empty() \
+                        and not self._synth_busy.is_set():
                     self._speaking.clear()
                     # The reply has genuinely stopped talking, as opposed to
                     # the gap between two sentences of the same reply.
@@ -470,25 +550,13 @@ class Mouth:
         self._out = None
         self._out_rate = None
 
-    def _play_stream(self, sentence: str, directions=None, release_ts=None,
-                     block: int = 2205, prebuffer_s: float = 0.75):
-        """Stream-synthesize and play with the head-start buffer (audio
-        law #2). stop() reacts ~50ms. The sample rate comes from
-        whichever engine actually answered."""
+    def _play_ready(self, rate, head, gen, directions=None, release_ts=None,
+                    t_synth_start=None, block: int = 2205):
+        """Play audio the synth worker already produced (head-start buffer
+        plus the rest of its generator — audio law #2). stop() reacts
+        ~50ms. Never synthesizes; that happens on the OTHER thread, one
+        chunk ahead, which is the entire point of the split."""
         from backtalk import signals
-        t_synth_start = time.time()
-        gen = synth_stream(sentence)
-        head: list = []
-        banked = 0
-        rate = None
-        for rate_, pcm in gen:
-            rate = rate_
-            head.append(pcm)
-            banked += len(pcm)
-            if banked >= int(rate * prebuffer_s):
-                break
-        if rate is None:
-            return
         try:
             out = self._get_out(rate)
             # AUDIO STARTS HERE: the head buffer is full and the first write
