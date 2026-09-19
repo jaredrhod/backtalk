@@ -31,10 +31,12 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (ClaudeAgentOptions, ClaudeSDKClient,
+                              ToolResultBlock, ToolUseBlock)
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
@@ -75,6 +77,12 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # Wall-clock time THIS turn has spent waiting on tool calls so far
+        # — reset at the start of every ask_stream(), read by main.py's
+        # speak_reply() the moment the first sentence ships, so the
+        # [bench] brain line can separate "waiting on tools" from
+        # "actually generating the reply" instead of conflating them.
+        self.tool_elapsed = 0.0
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -311,11 +319,35 @@ class WarmBrain:
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
         self._dirty = True             # in flight until its ResultMessage
+        self.tool_elapsed = 0.0
+        # Wall-clock span the turn is currently blocked on tool calls, or
+        # None while nothing is pending. Tracked by tool_use_id rather
+        # than a bare flag so PARALLEL tool calls in one AssistantMessage
+        # only close the span once every one of them has a result back —
+        # closing on the first result in would undercount the true wait.
+        _tool_start: float | None = None
+        _pending_tool_ids: set[str] = set()
         await self._client.query(utterance)
         buf = ""
         async for msg in self._client.receive_response():
             t = type(msg).__name__
-            if t == "StreamEvent":
+            if t == "AssistantMessage":
+                ids = {b.id for b in (msg.content or [])
+                      if isinstance(b, ToolUseBlock)}
+                if ids:
+                    if not _pending_tool_ids:
+                        _tool_start = time.time()
+                    _pending_tool_ids |= ids
+            elif t == "UserMessage":
+                content = msg.content
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, ToolResultBlock):
+                            _pending_tool_ids.discard(b.tool_use_id)
+                    if not _pending_tool_ids and _tool_start is not None:
+                        self.tool_elapsed += time.time() - _tool_start
+                        _tool_start = None
+            elif t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
                 if ev.get("type") == "content_block_delta":
                     delta = ev.get("delta", {}) or {}

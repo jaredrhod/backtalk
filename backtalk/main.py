@@ -609,7 +609,11 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
         if not s:
             return
         if first:
-            log(f"[bench] brain: {time.time()-t0:.2f}s to first sentence")
+            elapsed = time.time() - t0
+            tool_t = brain.tool_elapsed
+            gen_t = max(0.0, elapsed - tool_t)
+            log(f"[bench] brain: {elapsed:.2f}s to first sentence "
+                f"(tool {tool_t:.2f}s, gen {gen_t:.2f}s)")
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
             mouth.say_chunk(s, pending, release_ts=release_ts)
