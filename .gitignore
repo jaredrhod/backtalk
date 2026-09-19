@@ -1,6 +1,8 @@
 .DS_Store
 __pycache__/
 *.pyc
+.coverage
+htmlcov/
 .venv/
 logs/
 # the signal bus, written at runtime. A GLOB and not a list: the list named
