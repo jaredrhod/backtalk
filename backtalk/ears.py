@@ -45,6 +45,20 @@ MAX_UTTER_S = 30
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
 
+# Whisper's own closed vocabulary for describing a non-verbal sound,
+# normally seen bracketed ("(coughing)", "[LAUGHTER]"). Checked only
+# against the WHOLE utterance after stripping, so it can't eat a real
+# sentence that happens to contain one of these words.
+_NONSPEECH_WORDS = {
+    "cough", "coughing", "coughs", "sigh", "sighing", "sighs",
+    "laugh", "laughs", "laughing", "laughter", "clears throat",
+    "throat clearing", "sniff", "sniffs", "sniffling", "breathing",
+    "heavy breathing", "silence", "music", "applause", "clapping",
+    "humming", "yawn", "yawns", "yawning", "gasp", "gasps", "groan",
+    "groans", "groaning", "screaming", "crying", "static", "noise",
+    "background noise", "inaudible", "unintelligible",
+}
+
 _model = None
 _model_lock = threading.Lock()
 _backend = None          # "mlx" once the GPU path loads, else "faster-whisper"
@@ -336,9 +350,44 @@ def transcribe(pcm: np.ndarray) -> str:
                                       temperature=0.0, language=lang,
                                       verbose=None)["text"].strip()
     else:
-        segments, _ = model.transcribe(audio, temperature=0.0, language=lang)
+        # vad_filter runs a second, better VAD (Silero) over the captured
+        # audio before decoding. webrtcvad above decides WHEN to stop
+        # capturing; it isn't reliable enough to also decide the capture
+        # was real speech, so room noise / hum it mistakes for speech
+        # reaches Whisper as near-silent audio, and Whisper hallucinates
+        # stock training phrases ("thank you", "thanks for watching") onto
+        # it rather than returning nothing. vad_filter drops those
+        # non-speech spans before decoding so they come back empty instead.
+        segments, _ = model.transcribe(audio, temperature=0.0, language=lang,
+                                       vad_filter=True)
+        # A cough, throat-clear, or sigh still passes VAD as "someone
+        # made a vocal sound" -- VAD checks for a voice, not for words.
+        # Whisper then has to decode SOMETHING and hallucinates a stock
+        # training phrase onto it ("thank you", "thanks for watching")
+        # instead of admitting it heard no words. It reports its own
+        # confidence per segment though: no_speech_prob (this might not
+        # be speech at all) and avg_logprob (how sure it is of the words
+        # it chose). A hallucinated filler phrase over a non-verbal sound
+        # reliably scores badly on at least one, so segments failing
+        # either threshold are dropped as noise instead of trusted as
+        # words. Thresholds are faster-whisper's own documented defaults
+        # for detecting a bad decode, not tuned guesses.
+        segments = [s for s in segments
+                    if s.no_speech_prob < 0.6 and s.avg_logprob > -1.0]
         text = "".join(s.text for s in segments).strip()
-    return _NONSPEECH.sub("", text).strip()
+    text = _NONSPEECH.sub("", text).strip()
+    # A real cough can be loud and clean enough that Whisper is confident
+    # in both readings above -- it isn't guessing, it's just captioning
+    # the sound as a word instead of admitting no words were said. It
+    # picks that word from the same closed vocabulary it uses INSIDE the
+    # brackets the regex above strips ("(coughing)"), just without the
+    # brackets this time. This is a known finite training vocabulary, not
+    # a wild guess, so an exact match on the WHOLE utterance is safe to
+    # drop; it would take real bad luck for this to be the entire honest
+    # sentence someone actually meant to say.
+    if text.strip(".!? ").lower() in _NONSPEECH_WORDS:
+        return ""
+    return text
 
 
 class Ears:
