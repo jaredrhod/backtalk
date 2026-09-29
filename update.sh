@@ -33,7 +33,15 @@ main() {
     cp "$CFG" "$CFG.mine" && git checkout -q -- "$CFG" && MIGRATE=1
   fi
 
-  git pull --ff-only || echo "  (couldn't fast-forward; your local edits win.)"
+  if ! git pull --ff-only -q 2>/dev/null; then
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      echo "  (couldn't fast-forward; you have uncommitted local edits — commit them, then run this again.)"
+    elif git pull --no-rebase -q; then
+      echo "  (merged upstream changes on top of your local commits.)"
+    else
+      echo "  (merge hit a real conflict — resolve it by hand (git status shows what), then commit the result.)"
+    fi
+  fi
 
   if [ "$MIGRATE" = 1 ] && [ -f "$CFG.mine" ]; then
     mv "$CFG.mine" "$CFG"

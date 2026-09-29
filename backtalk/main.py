@@ -62,7 +62,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import WarmBrain, diagnose_connect_failure
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -698,12 +698,17 @@ async def amain():
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
+        stderr_tail = brain.recent_stderr()
         log(f"[backtalk] BRAIN CONNECT {kind}")
-        mouth.say("Bad news. The voice and the face are fine, but I "
+        if stderr_tail:
+            log(f"[backtalk] CLI stderr:\n{stderr_tail}")
+        diagnosis = diagnose_connect_failure(e, stderr_tail)
+        mouth.say(diagnosis or (
+                  "Bad news. The voice and the face are fine, but I "
                   "couldn't reach my brain, the Claude Code session. "
                   "Check this window for the error. The usual causes: "
                   "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
+                  "or the plan is out of usage."))
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
