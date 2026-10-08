@@ -60,6 +60,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 
 from backtalk import signals
 from backtalk.brain import WarmBrain
@@ -131,6 +132,17 @@ def _norm_speech(text):
     for ch in text.lower():
         out.append(ch if "a" <= ch <= "z" else " ")
     return " ".join("".join(out).split())
+
+
+# Exact matches only, same reasoning as _YES above: bare "hang up" is a
+# quit phrase, and a substring check turns "I don't want to hang up" or
+# "why does it hang up" into an actual hang up. The sentence has to BE
+# the command, not merely contain it.
+_QUIT_NORM = {_norm_speech(q) for q in QUIT_PHRASES}
+
+
+def _is_quit(text):
+    return _norm_speech(text) in _QUIT_NORM
 
 
 def _deny_pending(reason=_INTERRUPT_ANSWER):
@@ -687,25 +699,55 @@ async def amain():
     # case: the greeting played, then nothing, and on Windows the
     # window closed before anyone could read the error).
     log("[backtalk] connecting the brain...")
-    try:
-        await asyncio.wait_for(brain.start(), 120)
 
-        async def _warmup():
-            async for _ in brain.ask_stream(
-                    "Warmup ping - reply with the single word: ready"):
+    async def _warmup():
+        async for _ in brain.ask_stream(
+                "Warmup ping - reply with the single word: ready"):
+            pass
+
+    # Retry the connect. The first attempt after the machine wakes is
+    # the slow one: the bundled Claude Code process runs cold, the disk
+    # cache is empty, and the on-access antivirus scans every file in
+    # it, so a cold start can blow past two minutes. An immediate
+    # relaunch always connects in seconds (warm cache, scan already
+    # done), so rather than dying on the first miss, fail fast and try
+    # again in the same process. Only the last strike reads the
+    # bad-news line.
+    #
+    # Attempt 1 gets 200s so it can ride out the SDK's own initialize
+    # handshake allowance (raised to 180s via the persistent env var
+    # CLAUDE_CODE_STREAM_CLOSE_TIMEOUT — see the vault note "Jarvis
+    # Agent Stack"); a tighter ceiling here would cut that short. Later
+    # attempts are warm, so 120s is plenty.
+    BRAIN_TRIES = 3
+    for attempt in range(1, BRAIN_TRIES + 1):
+        try:
+            await asyncio.wait_for(brain.start(),
+                                   200 if attempt == 1 else 120)
+            await asyncio.wait_for(_warmup(), 180)
+            break
+        except (Exception, asyncio.TimeoutError) as e:
+            kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
+                    else f"failed: {e!r}"[:220])
+            log(f"[backtalk] BRAIN CONNECT {kind} "
+                f"(attempt {attempt}/{BRAIN_TRIES})")
+            try:
+                await brain.stop()   # clear any half-open subprocess
+            except Exception:
                 pass
-        await asyncio.wait_for(_warmup(), 180)
-    except (Exception, asyncio.TimeoutError) as e:
-        kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
-                else f"failed: {e!r}"[:220])
-        log(f"[backtalk] BRAIN CONNECT {kind}")
-        mouth.say("Bad news. The voice and the face are fine, but I "
-                  "couldn't reach my brain, the Claude Code session. "
-                  "Check this window for the error. The usual causes: "
-                  "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
-        mouth.wait_done(timeout=30)
-        raise SystemExit(1)
+            if attempt < BRAIN_TRIES:
+                if attempt == 1:
+                    mouth.say("My brain's slow to wake up. Give me a "
+                              "few seconds, I'm trying again.")
+                await asyncio.sleep(3)
+                continue
+            mouth.say("Bad news. The voice and the face are fine, but "
+                      "I couldn't reach my brain, the Claude Code "
+                      "session. Check this window for the error. The "
+                      "usual causes: Claude Code isn't signed in, the "
+                      "internet is down, or the plan is out of usage.")
+            mouth.wait_done(timeout=30)
+            raise SystemExit(1)
     log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
@@ -873,8 +915,7 @@ async def amain():
         if _PERM["fut"] is not None and not _PERM["fut"].done():
             started_after = (spoke_from is None
                              or spoke_from >= _PERM["asked_at"])
-            if _norm_speech(text) in {_norm_speech(q)
-                                      for q in QUIT_PHRASES}:
+            if _is_quit(text):
                 _PERM["fut"].set_result("no")
                 # falls through to the quit body below
             elif started_after:
@@ -892,11 +933,10 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
-                                         for q in QUIT_PHRASES):
+            elif not expired and not _is_quit(text):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        if _is_quit(text):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -1098,7 +1138,36 @@ def _claim_single_instance() -> bool:
     return True
 
 
+def _disable_windows_quickedit():
+    """Turn off the console's QuickEdit Mode (Windows only), best-effort.
+
+    QuickEdit freezes the console's I/O the moment text is selected, and
+    a stray left-click instead of a right-click (deselect, not copy)
+    leaves it stuck there — which starves whatever this process was
+    mid-read/write on and brings the whole session down with no crash
+    trace, logged only as a clean "hung up". Clearing the flag on our
+    own input handle turns every future click into a no-op instead.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        STD_INPUT_HANDLE = -10
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        pass
+
+
 def main():
+    _disable_windows_quickedit()
     if not _claim_single_instance():
         print("[backtalk] ANOTHER VOICE LINE IS ALREADY RUNNING on this "
               "machine, so this one is stopping.", flush=True)
@@ -1111,6 +1180,14 @@ def main():
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\n[backtalk] interrupted — hanging up", flush=True)
+    except Exception:
+        # Anything else that escapes amain() used to print its traceback
+        # to whatever console happened to be open and vanish with it once
+        # that window closed — the crash left no trace in backtalk.log.
+        # Logging it here means the next crash is diagnosable from the
+        # log alone.
+        log("[backtalk] CRASHED:\n" + traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == "__main__":
