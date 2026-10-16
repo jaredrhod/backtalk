@@ -3,5 +3,20 @@
   "name": "Assistant",
   "ptt_key": "home",
   "voice": "bm_lewis",
-  "stt_model": "small.en"
+  "stt_model": "small",
+  "stt_model_if_cached": "medium",
+  "stt_device": "cpu",
+  "stt_compute": "int8_float32",
+  "stt_min_rms": 200,
+  "stt_min_speech_ms": 400,
+  "stt_no_speech_prob": 0.5,
+  "journal_dir": "",
+  "journal_summary": true,
+  "mic_mode": "ptt",
+  "barge_in": false,
+  "wake_word": false,
+  "wake_word_phrases": [
+    "hey seyon", "hey sayon", "hey sean",
+    "hey saiyan", "a seyon", "hey siyon"
+  ]
 }

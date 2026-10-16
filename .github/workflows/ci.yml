@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      # sounddevice needs PortAudio at import time; webrtcvad builds from
+      # source on Linux. Both are import-time needs of the fast suites.
+      - name: system audio libraries
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      - name: install
+        run: uv sync
+
+      - name: lint
+        run: uv run ruff check backtalk tests
+
+      - name: types
+        run: uv run pyright
+
+      # --fast skips the suites that download whisper weights or start a
+      # TTS engine: those are minutes long and belong on a dev machine,
+      # not on every push. --coverage runs the same suites under
+      # coverage.py and fails if backtalk/ drops below the floor in
+      # tests/run_all.py -- the goal is that the number never goes down.
+      - name: tests + coverage
+        run: uv run python tests/run_all.py --fast --coverage

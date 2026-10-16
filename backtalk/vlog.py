@@ -1,4 +1,4 @@
-# backtalk: talk to your Claude Code agent out loud.
+# backtalk: talk to your opencode agent out loud.
 # Copyright (C) 2026 Jared Rhodenizer
 #
 # This program is free software: you can redistribute it and/or modify
@@ -53,7 +53,7 @@ def _init_console():
         pass
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")  # pyright: ignore[reportAttributeAccessIssue]
         except Exception:
             pass
 

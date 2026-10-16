@@ -1,4 +1,4 @@
-# backtalk: talk to your Claude Code agent out loud.
+# backtalk: talk to your opencode agent out loud.
 # Copyright (C) 2026 Jared Rhodenizer
 #
 # This program is free software: you can redistribute it and/or modify
@@ -36,6 +36,7 @@ its format (state/state as a bare word, state/wave.json normalized
 
 Every write is wrapped: the bus must never crash the voice line.
 """
+import atexit
 import json
 import os
 import subprocess
@@ -78,6 +79,34 @@ def set_state(name: str):
                 f.write(name)
         except OSError:
             pass
+
+
+def park():
+    """Leave the bus reading `idle`, with the thinking sound stopped.
+
+    The state that is true whenever nothing is running, so it is what a
+    departing voice line should leave behind. Never raises."""
+    set_state("idle")
+    static_stop()
+
+
+def register_exit_park():
+    """Park the bus when this process leaves, however it leaves.
+
+    A voice that dies mid-speech otherwise strands the bus at
+    `speaking`: the finally in amain() is what normally writes `idle`,
+    and a dying process that never reaches it leaves a face showing a
+    speaker that is long gone. atexit covers the deaths a Python
+    process can clean up after — an uncaught exception, sys.exit, a
+    crash that unwinds the interpreter.
+
+    It cannot cover `taskkill /F`, which is how the supervisor restarts
+    a wedged voice, and no handler inside the dying process ever could.
+    That case is answered from the other side instead: the successor
+    parks the bus the moment it claims the instance, because holding
+    that lock is proof that nothing else can be speaking.
+    """
+    atexit.register(park)
 
 
 def feed_waveform(pcm: np.ndarray):
@@ -127,6 +156,19 @@ def direction(items):
         with open(_DIRECTION_FILE, "w") as f:
             f.write(json.dumps({"ts": time.time(), "directions": list(items)}))
     except OSError:
+        pass
+
+
+_LANG_FILE = os.path.join(_DIR, ".voice_language")
+
+
+def language(code: str | None):
+    """The language the current turn is being held in, so a face can show
+    which tongue Jarvis picked. None when it could not be told apart."""
+    try:
+        with open(_LANG_FILE, "w") as f:
+            json.dump({"ts": time.time(), "language": code or None}, f)
+    except (OSError, TypeError, ValueError):
         pass
 
 
@@ -197,12 +239,20 @@ def static_start():
     if not cmd:
         return
     try:
-        _static_proc = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(_LOADING_PID_FILE, "w") as f:
-            f.write(str(_static_proc.pid))
     except OSError:
         _static_proc = None
+        return
+    # The player is running now, so remember it even if the pid file cannot
+    # be written: otherwise a successful Popen whose pid-file write failed
+    # would orphan a looping player for the rest of the session.
+    _static_proc = proc
+    try:
+        with open(_LOADING_PID_FILE, "w") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        pass
 
 
 def static_stop():
@@ -215,5 +265,75 @@ def static_stop():
         _static_proc = None
     try:
         os.remove(_LOADING_PID_FILE)
+    except OSError:
+        pass
+
+
+_CAPTION_FILE = os.path.join(_DIR, ".voice_caption")
+
+
+def caption(text: str):
+    """The words Jarvis is speaking right now, published as they stream.
+
+    The face already knows it is thinking or speaking; this is the
+    sentence itself, so a display can caption the reply as it happens
+    instead of showing only an expression. Written per sentence, so a
+    reader polling the bus sees the reply build up. Never raises.
+    """
+    try:
+        with open(_CAPTION_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text or ""}))
+    except OSError:
+        pass
+
+
+def caption_clear():
+    """Drop the caption once the reply is over."""
+    try:
+        os.remove(_CAPTION_FILE)
+    except OSError:
+        pass
+
+
+_HEARD_FILE = os.path.join(_DIR, ".voice_heard")
+
+
+def heard(text: str, final: bool = False):
+    """The words being heard as they arrive, for a face to caption live.
+
+    caption() is what the agent is SAYING; this is what it is HEARING. A
+    partial transcript lands here while the person is still talking (see
+    ears.PartialStream), so a display can show the words build up instead
+    of waiting for the whole turn. `final` marks the finished transcript,
+    which may differ from the last partial. Never raises."""
+    try:
+        with open(_HEARD_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text or "",
+                                "final": bool(final)}))
+    except OSError:
+        pass
+
+
+def heard_clear():
+    """Drop the heard line once the turn is taken over."""
+    try:
+        os.remove(_HEARD_FILE)
+    except OSError:
+        pass
+
+
+_ACTIVE_FILE = os.path.join(_DIR, ".voice_active_window")
+
+
+def active_window(text: str):
+    """What the activity tracker last saw focused, for a face to show.
+
+    Local only and never raises: a display is a courtesy, not something
+    the voice line should ever fail over. The reader treats a stale
+    timestamp as "unknown", so there is nothing to clear.
+    """
+    try:
+        with open(_ACTIVE_FILE, "w") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text or ""}))
     except OSError:
         pass

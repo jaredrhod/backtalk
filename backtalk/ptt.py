@@ -1,4 +1,4 @@
-# backtalk: talk to your Claude Code agent out loud.
+# backtalk: talk to your opencode agent out loud.
 # Copyright (C) 2026 Jared Rhodenizer
 #
 # This program is free software: you can redistribute it and/or modify
@@ -45,13 +45,29 @@ group or an X11 session.
 """
 import threading
 import time
+from typing import Any
 
-from pynput import keyboard
+# pynput needs a real desktop session to hook a global key. On a headless
+# box (a server, or CI) its import raises "failed to acquire X connection",
+# which would otherwise take the whole voice line down at import time --
+# `from backtalk import main` alone would die. Hook-to-talk is optional;
+# the open mic is not, so a missing backend is recorded and only bites
+# when someone actually asks for a key listener.
+try:
+    from pynput import keyboard as _pynput_keyboard
+    _PTT_ERROR: Exception | None = None
+except Exception as _exc:          # any import-time failure means no hook
+    _pynput_keyboard = None
+    _PTT_ERROR = _exc
+
+keyboard: Any = _pynput_keyboard
 
 
 def resolve_key(name: str):
     """'home' / 'f13' / 'right_alt' / any single character -> pynput key."""
     name = (name or "home").strip().lower()
+    if keyboard is None:
+        return name                    # no backend; PTTListener will refuse
     if len(name) == 1:
         return keyboard.KeyCode.from_char(name)
     # Friendly names -> pynput's names. pynput calls the right option key
@@ -81,11 +97,20 @@ class PTTListener:
     # is ~30ms) and short enough that letting go still feels instant.
     RELEASE_GRACE = 0.12
 
-    def __init__(self, key="home"):
-        self._key = resolve_key(key) if isinstance(key, str) else key
+    def __init__(self, key: str = "home"):
+        if keyboard is None:
+            raise RuntimeError(
+                "hold-to-talk needs a desktop session, but the keyboard "
+                f"backend would not start ({_PTT_ERROR}). Use the open "
+                "microphone (\"Hey Seyon\") instead.")
+        self._key = resolve_key(key)
         self._held = False
         self._release_t = None          # a release awaiting confirmation
         self._press_evt = threading.Event()
+        # Guarded so the listener thread (_on_press/_on_release) and the
+        # turn loop (_settle via is_held/wait_press) never read half-updated
+        # state or miss each other's writes.
+        self._lock = threading.Lock()
         self._listener = keyboard.Listener(on_press=self._on_press,
                                            on_release=self._on_release)
         self._listener.daemon = True
@@ -94,25 +119,28 @@ class PTTListener:
     def _on_press(self, k):
         if k != self._key:
             return
-        # A press cancels any pending release: that release was auto-repeat,
-        # not a human letting go.
-        self._release_t = None
-        if not self._held:                      # filter key-repeat
-            self._held = True
-            self._press_evt.set()
+        with self._lock:
+            # A press cancels any pending release: that release was
+            # auto-repeat, not a human letting go.
+            self._release_t = None
+            if not self._held:                      # filter key-repeat
+                self._held = True
+                self._press_evt.set()
 
     def _on_release(self, k):
         if k == self._key:
-            # PROVISIONAL. Believed only if no press follows; see _settle().
-            self._release_t = time.monotonic()
+            with self._lock:
+                # PROVISIONAL. Believed only if no press follows; see _settle().
+                self._release_t = time.monotonic()
 
     def _settle(self):
         """Commit a release that has stood unchallenged for the grace window."""
-        r = self._release_t
-        if self._held and r is not None and \
-                time.monotonic() - r >= self.RELEASE_GRACE:
-            self._held = False
-            self._release_t = None
+        with self._lock:
+            r = self._release_t
+            if self._held and r is not None and \
+                    time.monotonic() - r >= self.RELEASE_GRACE:
+                self._held = False
+                self._release_t = None
 
     def wait_press(self):
         """Block until the key goes DOWN (one event per physical press)."""

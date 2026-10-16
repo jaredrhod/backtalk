@@ -2,16 +2,16 @@
 
 > **Never used Claude Code?** Start at [jaredrhod.com](https://jaredrhod.com): pick your situation and it routes you to the right path.
 
-**Runs on:** Claude Code only; the voice is built on Claude's agent SDK. The $20 Pro plan is enough.
+**Runs on:** opencode. The brain is opencode's own local server, so any provider you have signed in to works — including the free tiers. Nothing here needs a paid subscription.
 
-Talk to your Claude Code agent out loud. Hold a key, say the thing, and it answers through your speakers in a real voice about a second later, with all its tools, your project context, and its own personality. Your AI finally has something to say back.
+Talk to your opencode agent out loud. Hold a key, say the thing, and it answers through your speakers in a real voice about a second later, with all its tools, your project context, and its own personality. Your AI finally has something to say back.
 
-The hearing and the voice run local: free, offline models on your machine, no voice API keys, no per-word costs. The brain is the Claude Code you already have. On a Claude subscription, talking works like any other session and uses your plan's usage, with nothing extra to buy. This is the same voice loop I run every day, the one you see answering in about a second on my videos, shipped as working code so your agent's job is pointing it at your setup, not building it from scratch.
+The hearing and the voice run local: free, offline models on your machine, no voice API keys, no per-word costs. The brain is the opencode you already have — it starts its own local server on demand, or reuses one that is already running. Because the provider is opencode's, a free model is a first-class option, not a compromise.
 
 ## What it does
 
-- **Hold a key, talk, release.** Your words are transcribed locally and handed to a live Claude Code session. The reply is spoken sentence by sentence as it's generated, with first audio in about 1 to 2 seconds on warm turns. Prefer no button at all? **Hands-free listening** is one spoken sentence away ("go hands free"), and the key keeps working there as your interrupt.
-- **It's YOUR agent talking.** The session runs in the folder whose CLAUDE.md defines your assistant: same name, same personality, same memory as your terminal sessions. backtalk has no personality of its own; it's a mouth and ears for whoever you already have. (No agent yet? The [ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault) build ships with mine, Jarvis, ready to use.)
+- **Hold a key, talk, release.** Your words are transcribed locally and handed to a live opencode session. The reply is spoken sentence by sentence as it's generated, with first audio in about 1 to 2 seconds on warm turns. Prefer no button at all? **Hands-free listening** is one spoken sentence away ("go hands free"), and the key keeps working there as your interrupt.
+- **It's YOUR agent talking.** The session runs in the folder whose AGENTS.md defines your assistant: same name, same personality, same memory as your terminal sessions. backtalk has no personality of its own; it's a mouth and ears for whoever you already have. (No agent yet? The [ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault) build ships with mine, Jarvis, ready to use.)
 - **Interrupt it.** Press the key while it's talking and it shuts up and listens. No headphones needed, because the mic only opens while you hold the key, so it never hears the speakers.
 - **Type instead whenever you want.** Typing in the terminal is the same conversation, and the reply is still spoken.
 - **It asks before it acts, in plain words.** When your agent wants to do something real, it asks out loud the way a person would ("I want to change a note in your vault called Recipes") and waits. An exact spoken yes approves; "details" reads you the exact command; anything else denies, with your words passed back as the reason, so "no, put that in drafts instead" actually steers it. Most read-only work passes without interrupting. Prefer auto-approve? Say "stop asking for permission" (or "turn off the permission prompts") and confirm; it changes its own config, and the first ask of every session reminds you the phrase exists.
@@ -71,6 +71,23 @@ Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (t
 - **The talk key needs a global key listener.** For the key to work when the voice line isn't your focused window, the process has to watch keyboard events system-wide. `backtalk/ptt.py` compares each event against the one key you configured and discards the rest. It stores nothing and writes nothing anywhere. Ninety-one lines, so you can read all of it in a minute. macOS asks for Input Monitoring permission before it will run, which is the OS telling you what the program can see.
 - **Pin the microphone if you wear a headset.** By default it records from the system default input, which the OS hands to a headset the moment one connects, taking your voice down the narrowband call profile and degrading what you hear at the same time. Set `"mic_device"` in backtalk.json to the input you want, by name (`"MacBook Pro Microphone"`), and the mic stays put whatever connects for output. A name that matches nothing falls back to the default with a log line rather than going mute. (Credit where due: this grew out of a proposal by MacphersonDesigns.)
 - Something misbehaving? `TROUBLESHOOTING.md` covers the classics, and `logs/backtalk.log` has the receipts.
+
+## Developing
+
+backtalk has no pytest; each test is a standalone script. One command runs
+them all, and a couple more run the gates:
+
+```
+uv run python tests/run_all.py          # every suite
+uv run python tests/run_all.py --fast   # skip the model-loading suites (CI)
+uv run ruff check backtalk tests        # lint (error-level rules)
+uv run pyright                          # type gate (basic mode)
+```
+
+`AGENTS.md` is the developer guide: the layout, the invariants that must
+not regress, and how to add a suite. `tests/README.md` lists what each
+suite proves. GitHub Actions (`.github/workflows/ci.yml`) runs the lint,
+type, and fast suites on every push.
 
 ## Credits
 

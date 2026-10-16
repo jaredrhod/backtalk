@@ -1,4 +1,4 @@
-# backtalk: talk to your Claude Code agent out loud.
+# backtalk: talk to your opencode agent out loud.
 # Copyright (C) 2026 Jared Rhodenizer
 #
 # This program is free software: you can redistribute it and/or modify

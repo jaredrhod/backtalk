@@ -9,7 +9,10 @@ logs/
 # conversation -- noisy forever, and enough to make an update script believe
 # they had local edits. An enumerated list goes stale the day the code grows.
 .voice_*
-uv.lock
+# The resumed-session pointer and the daily-briefing marker live in signals_dir
+# (the repo root by default) too; per-machine runtime state, never code.
+.backtalk_session
+.briefing_day
 backtalk.egg-info/
 # your personal config, created at setup: never tracked, never touched by updates
 backtalk.json
@@ -22,3 +25,15 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+
+# coverage.py's data file and HTML report, written by `run_all.py --coverage`.
+.coverage
+.coverage.*
+htmlcov/
+
+# The user's own copy of backtalk.json. Every setting in it is already in
+# config.py's DEFAULTS -- what this file adds is machine-specific: absolute
+# paths and the assistant's name. Committing those would bake one person's
+# C:\Users\<name> layout into a fresh clone. backtalk.json.example is the
+# tracked template; this file stays on disk and is read at startup.
+backtalk.json
