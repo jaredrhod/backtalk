@@ -31,21 +31,71 @@ never the character.
 import asyncio
 import os
 import re
+import time
 import warnings
 from datetime import datetime
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (ClaudeAgentOptions, ClaudeSDKClient,
+                              ToolResultBlock, ToolUseBlock)
 
 try:
     from claude_agent_sdk import CanUseToolShadowedWarning
 except ImportError:                       # older SDKs: nothing to silence
     CanUseToolShadowedWarning = None
 
+try:
+    from claude_agent_sdk import CLINotFoundError
+except ImportError:                       # older SDKs: type check skipped
+    CLINotFoundError = None
+
 from backtalk import signals
 from backtalk.config import CFG, DISCIPLINE
 from backtalk.vlog import log
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+
+# Substrings the Claude Code CLI (or the SDK wrapping it) actually uses
+# for each failure family, gathered from its own error text — matched
+# against the exception AND its captured stderr, never against the
+# Kokoro/torch warnings that also print around startup, which is why an
+# unrelated console warning can never trigger a diagnosis here.
+_AUTH_HINTS = ("not logged in", "please run", "/login", "log in",
+               "unauthorized", "invalid api key", "authentication",
+               "re-authenticate", " 401")
+_USAGE_HINTS = ("rate limit", "usage limit", "quota", "exceeded", " 429")
+_NETWORK_HINTS = ("enotfound", "econnrefused", "getaddrinfo",
+                   "network is unreachable", "network error")
+
+
+def diagnose_connect_failure(exc: Exception, stderr_tail: str = "") -> str | None:
+    """A specific, spoken cause for a failed brain.start()/warmup, when the
+    CLI's own stderr or the SDK's exception names one — instead of the
+    three-cause guessing list this replaces. Returns None when nothing
+    matched, so the caller can fall back to that generic message.
+
+    Built because the SDK never pipes the CLI's stderr unless a callback
+    is registered (see WarmBrain._on_stderr): without it a failed connect
+    carries only "Check stderr output for details", so the real reason
+    (not signed in, no network, out of usage...) was visible ONLY on the
+    raw console and never to code that could say something useful about
+    it."""
+    if CLINotFoundError is not None and isinstance(exc, CLINotFoundError):
+        return ("I can't find the Claude Code CLI at all. It may not be "
+                "installed, or it's not on the PATH.")
+    haystack = " ".join(filter(None, [
+        str(exc), stderr_tail,
+        " ".join(getattr(exc, "errors", None) or []),
+    ])).lower()
+    if any(h in haystack for h in _AUTH_HINTS):
+        return ("Claude Code needs you to sign back in. Run claude in a "
+                "terminal, log in again, then relaunch me.")
+    if any(h in haystack for h in _USAGE_HINTS):
+        return ("The plan's out of usage. Check your Claude Code limits "
+                "before relaunching me.")
+    if any(h in haystack for h in _NETWORK_HINTS):
+        return ("I can't reach the network. Check the internet connection "
+                "and relaunch me.")
+    return None
 
 
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
@@ -75,8 +125,31 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # The CLI subprocess's own stderr for the CURRENT connect attempt.
+        # Without this the SDK never pipes stderr at all (no callback ==
+        # no PIPE), so a failed connect's ProcessError carries the literal
+        # placeholder text "Check stderr output for details" and the real
+        # reason (not signed in, no network, out of usage...) is visible
+        # ONLY on the raw console, never to our own error handling. See
+        # diagnose_connect_failure below, which is the reason this exists.
+        self._stderr_lines: list[str] = []
+        # Wall-clock time THIS turn has spent waiting on tool calls so far
+        # — reset at the start of every ask_stream(), read by main.py's
+        # speak_reply() the moment the first sentence ships, so the
+        # [bench] brain line can separate "waiting on tools" from
+        # "actually generating the reply" instead of conflating them.
+        self.tool_elapsed = 0.0
+
+    def _on_stderr(self, line: str):
+        self._stderr_lines.append(line)
+        del self._stderr_lines[:-80]   # a connect-attempt scratchpad,
+                                        # not a session transcript
+
+    def recent_stderr(self) -> str:
+        return "\n".join(self._stderr_lines).strip()
 
     async def start(self):
+        self._stderr_lines = []   # fresh per connect attempt
         mode = CFG["permission_mode"]
         if mode == "default":
             mode = "ask"     # legacy alias, see config.py
@@ -103,6 +176,7 @@ class WarmBrain:
                 add_dirs=CFG["extra_dirs"],
                 skills=CFG["visible_skills"],
                 resume=rid,
+                stderr=self._on_stderr,
             )
         if resume:
             try:
@@ -311,11 +385,35 @@ class WarmBrain:
     async def ask_stream(self, utterance: str):
         """Yield complete sentences as they stream out of the model."""
         self._dirty = True             # in flight until its ResultMessage
+        self.tool_elapsed = 0.0
+        # Wall-clock span the turn is currently blocked on tool calls, or
+        # None while nothing is pending. Tracked by tool_use_id rather
+        # than a bare flag so PARALLEL tool calls in one AssistantMessage
+        # only close the span once every one of them has a result back —
+        # closing on the first result in would undercount the true wait.
+        _tool_start: float | None = None
+        _pending_tool_ids: set[str] = set()
         await self._client.query(utterance)
         buf = ""
         async for msg in self._client.receive_response():
             t = type(msg).__name__
-            if t == "StreamEvent":
+            if t == "AssistantMessage":
+                ids = {b.id for b in (msg.content or [])
+                      if isinstance(b, ToolUseBlock)}
+                if ids:
+                    if not _pending_tool_ids:
+                        _tool_start = time.time()
+                    _pending_tool_ids |= ids
+            elif t == "UserMessage":
+                content = msg.content
+                if isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, ToolResultBlock):
+                            _pending_tool_ids.discard(b.tool_use_id)
+                    if not _pending_tool_ids and _tool_start is not None:
+                        self.tool_elapsed += time.time() - _tool_start
+                        _tool_start = None
+            elif t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
                 if ev.get("type") == "content_block_delta":
                     delta = ev.get("delta", {}) or {}
