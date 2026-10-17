@@ -34,6 +34,22 @@ The installer sets up a Python environment, the two local AI models (speech-to-t
 
 **Already in a Claude Code session with your agent?** One sentence does the whole install: *"clone https://github.com/jaredrhod/backtalk.git, then read backtalk/backtalk.md and set me up."* Your agent runs the installer and the wizard for you.
 
+## Build and test
+
+The lightweight checks deliberately avoid launching audio devices, downloading
+models, or using cloud credentials. Install [uv](https://docs.astral.sh/uv/),
+then run:
+
+```sh
+make build      # build source and wheel distributions
+make test       # configuration and signal-bus unit tests
+make coverage   # the same tests with a terminal coverage report
+```
+
+The supported Python range is 3.11 through 3.12. The test suite is a foundation
+for future interruption, queue-handling, and synthesis-failure regressions; it
+does not claim to exercise live microphone or playback behavior.
+
 **The manual way:** copy `backtalk.json.example` to `backtalk.json` (your copy is untracked, so updates never touch it), then edit it. Point `agent_dir` at the folder whose CLAUDE.md is your agent, set `name` to your agent's name, pick a `ptt_key`. Then:
 
 ```
