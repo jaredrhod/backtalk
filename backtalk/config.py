@@ -207,6 +207,12 @@ DEFAULTS = {
     # CLAUDE.md covers the character. Use this for a note that belongs to
     # neither, e.g. a rule that only applies when it is speaking.
     "discipline_append": "",
+    # [bench] latency lines (synth/gap/stt/brain timing, from upstream
+    # PR #50) print to the console and the log file on every turn. True
+    # by default so the instrumentation nobody's reported a problem with
+    # keeps working unchanged; set false to drop them from BOTH if the
+    # live chatter is more noise than signal for your setup.
+    "bench_log": True,
 }
 
 # The spoken-delivery discipline — the MEDIUM half of what used to be a

@@ -88,6 +88,20 @@ Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (t
 - **Pin the microphone if you wear a headset.** By default it records from the system default input, which the OS hands to a headset the moment one connects, taking your voice down the narrowband call profile and degrading what you hear at the same time. Set `"mic_device"` in backtalk.json to the input you want, by name (`"MacBook Pro Microphone"`), and the mic stays put whatever connects for output. A name that matches nothing falls back to the default with a log line rather than going mute. (Credit where due: this grew out of a proposal by MacphersonDesigns.)
 - Something misbehaving? `TROUBLESHOOTING.md` covers the classics, and `logs/backtalk.log` has the receipts.
 
+## Changes in this fork
+
+- **A switch for the `[bench]` latency lines.** Upstream PR #50 added `[bench]` timing lines (synth/gap/stt/brain) to the console and `logs/backtalk.log` on every turn, with no way to turn them off. This fork adds a `bench_log` config key so you can silence them without losing the rest of the console output.
+
+**To silence them:** add this to your `backtalk.json`:
+
+```json
+{
+  "bench_log": false
+}
+```
+
+Default is `true` (unchanged behavior — the lines keep printing). Set it to `false` and `[bench]` lines stop appearing in both the console and `logs/backtalk.log`; everything else still logs normally. Takes effect on the next launch.
+
 ## Credits
 
 Speech recognition by [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (MIT) running [OpenAI Whisper](https://github.com/openai/whisper) models (MIT). Voice by [Kokoro](https://github.com/hexgrad/kokoro) (Apache 2.0) with [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0, used as a system tool) for phonemization. Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview).
