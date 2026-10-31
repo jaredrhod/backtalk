@@ -34,6 +34,22 @@ The installer sets up a Python environment, the two local AI models (speech-to-t
 
 **Already in a Claude Code session with your agent?** One sentence does the whole install: *"clone https://github.com/jaredrhod/backtalk.git, then read backtalk/backtalk.md and set me up."* Your agent runs the installer and the wizard for you.
 
+## Build and test
+
+The lightweight checks deliberately avoid launching audio devices, downloading
+models, or using cloud credentials. Install [uv](https://docs.astral.sh/uv/),
+then run:
+
+```sh
+make build      # build source and wheel distributions
+make test       # configuration and signal-bus unit tests
+make coverage   # the same tests with a terminal coverage report
+```
+
+The supported Python range is 3.11 through 3.12. The test suite is a foundation
+for future interruption, queue-handling, and synthesis-failure regressions; it
+does not claim to exercise live microphone or playback behavior.
+
 **The manual way:** copy `backtalk.json.example` to `backtalk.json` (your copy is untracked, so updates never touch it), then edit it. Point `agent_dir` at the folder whose CLAUDE.md is your agent, set `name` to your agent's name, pick a `ptt_key`. Then:
 
 ```
@@ -71,6 +87,20 @@ Mind ([ai-memory-vault](https://github.com/jaredrhod/ai-memory-vault)), mouth (t
 - **The talk key needs a global key listener.** For the key to work when the voice line isn't your focused window, the process has to watch keyboard events system-wide. `backtalk/ptt.py` compares each event against the one key you configured and discards the rest. It stores nothing and writes nothing anywhere. Ninety-one lines, so you can read all of it in a minute. macOS asks for Input Monitoring permission before it will run, which is the OS telling you what the program can see.
 - **Pin the microphone if you wear a headset.** By default it records from the system default input, which the OS hands to a headset the moment one connects, taking your voice down the narrowband call profile and degrading what you hear at the same time. Set `"mic_device"` in backtalk.json to the input you want, by name (`"MacBook Pro Microphone"`), and the mic stays put whatever connects for output. A name that matches nothing falls back to the default with a log line rather than going mute. (Credit where due: this grew out of a proposal by MacphersonDesigns.)
 - Something misbehaving? `TROUBLESHOOTING.md` covers the classics, and `logs/backtalk.log` has the receipts.
+
+## Changes in this fork
+
+- **A switch for the `[bench]` latency lines.** Upstream PR #50 added `[bench]` timing lines (synth/gap/stt/brain) to the console and `logs/backtalk.log` on every turn, with no way to turn them off. This fork adds a `bench_log` config key so you can silence them without losing the rest of the console output.
+
+**To silence them:** add this to your `backtalk.json`:
+
+```json
+{
+  "bench_log": false
+}
+```
+
+Default is `true` (unchanged behavior — the lines keep printing). Set it to `false` and `[bench]` lines stop appearing in both the console and `logs/backtalk.log`; everything else still logs normally. Takes effect on the next launch.
 
 ## Credits
 

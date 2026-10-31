@@ -34,7 +34,9 @@ to the fast model" / "set effort to low" (or medium, high, max) /
 called auto-approve, a different axis than the microphone on purpose).
 And with permission_mode "ask" (the default), gated tool calls ASK OUT
 LOUD and your spoken yes or no decides them; any other answer is
-passed back to the agent as the reason.
+passed back to the agent as the reason. Tools matched by an "allow"
+rule in .claude/settings.json (reads and lookups) skip the spoken ask
+entirely; a "deny" rule blocks silently; everything else still asks.
 
 Flags:
   --open-mic   start in hands-free listening for this session (the
@@ -55,6 +57,7 @@ Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 import asyncio
 import json
 import queue
+import os
 import re
 import socket
 import sys
@@ -62,7 +65,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import WarmBrain, diagnose_connect_failure
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -82,6 +85,14 @@ QUIT_PHRASES = CFG["quit_phrases"]
 PERM_TIMEOUT_S = 75
 _PERM = {"fut": None, "asked_at": 0.0,   # pending ask + when it was posed
          "hinted": False}                # escape-hatch hint said yet?
+# _PERM has exactly one slot: if two tool calls need a decision at the
+# same moment (e.g. two tools requested in the same turn), a second
+# gate() would overwrite the first one's "fut" before it's answered,
+# orphaning it to time out no matter what the user said. This lock
+# serializes concurrent asks so only one question is ever live; a
+# second caller waits quietly and speaks its own question only after
+# the first is fully resolved.
+_PERM_LOCK = asyncio.Lock()
 _CONFIRM = {"verb": None, "at": 0.0}     # pending "say confirm" + when
 _INTERRUPT_ANSWER = "\x00interrupt"      # sentinel: turn is being killed
 # Live AUTO-APPROVE is OUR flag, not an SDK mode flip: the CLI refuses
@@ -210,6 +221,88 @@ def _full_detail(tool, tool_input, ctx):
     return f"use {name}" + (f", {desc[:70]}" if desc else "")
 
 
+# ---- SETTINGS.JSON-BACKED AUTO-ALLOW. Claude Code's own permission
+# rules (allow/ask/deny in .claude/settings.json) already encode a
+# useful split: reads and lookups auto-clear, writes/drafts/sends
+# stay gated. The spoken gate below used to ignore that file and ask
+# about literally everything; this checks the same rules first, so a
+# tool matched by an "allow" rule skips the spoken ask, one matched by
+# "deny" is blocked silently, and anything else (an "ask" rule, or no
+# rule at all) still falls through to the spoken yes/no — unmatched
+# tools stay safe-by-default, never open-by-default.
+_RULES_CACHE = {"mtimes": None, "rules": ([], [], [])}
+
+
+def _rule_paths():
+    return [
+        os.path.expanduser("~/.claude/settings.json"),
+        os.path.join(CFG["agent_dir"], ".claude", "settings.json"),
+        os.path.join(CFG["agent_dir"], ".claude", "settings.local.json"),
+    ]
+
+
+def _path_mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return None
+
+
+def _load_permission_rules():
+    """Merge allow/ask/deny arrays across user, project, and project-
+    local settings files — same load order and array-merge behavior
+    Claude Code itself uses. Re-checked by mtime each call so an edit
+    to settings.json takes effect without a restart; missing or
+    unreadable files just contribute nothing."""
+    paths = _rule_paths()
+    mtimes = tuple(_path_mtime(p) for p in paths)
+    if mtimes == _RULES_CACHE["mtimes"]:
+        return _RULES_CACHE["rules"]
+    allow, ask, deny = [], [], []
+    for p in paths:
+        try:
+            with open(p) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        perms = data.get("permissions") or {}
+        allow.extend(perms.get("allow") or [])
+        ask.extend(perms.get("ask") or [])
+        deny.extend(perms.get("deny") or [])
+    _RULES_CACHE["mtimes"] = mtimes
+    _RULES_CACHE["rules"] = (allow, ask, deny)
+    return allow, ask, deny
+
+
+def _rule_matches(rule, tool, tool_input):
+    """Same rule syntax Claude Code's own settings use: a bare tool
+    name ("Read") matches every call to that tool; "Tool(pattern)"
+    narrows to Bash commands, where a trailing * is a prefix match and
+    no trailing * requires an exact command match. Other Tool(...)
+    forms (Edit(path), WebFetch(domain:...)) aren't matched here yet —
+    they simply never match, which falls through to the spoken ask,
+    the safe direction."""
+    if "(" not in rule:
+        return rule == tool
+    base, _, rest = rule.partition("(")
+    if base != tool or tool != "Bash":
+        return False
+    pattern = rest[:-1] if rest.endswith(")") else rest
+    cmd = str((tool_input or {}).get("command", ""))
+    if pattern.endswith("*"):
+        return cmd.startswith(pattern[:-1])
+    return cmd == pattern
+
+
+def _classify_permission(tool, tool_input):
+    allow, ask, deny = _load_permission_rules()
+    if any(_rule_matches(r, tool, tool_input) for r in deny):
+        return "deny"
+    if any(_rule_matches(r, tool, tool_input) for r in allow):
+        return "allow"
+    return "ask"
+
+
 def make_permission_gate(mouth):
     from claude_agent_sdk import (PermissionResultAllow,
                                   PermissionResultDeny)
@@ -217,81 +310,94 @@ def make_permission_gate(mouth):
     async def gate(tool, tool_input, ctx):
         if _AUTOAPPROVE["on"]:
             return PermissionResultAllow(behavior="allow")
-        what = _human_what(tool, tool_input, ctx)
-        detail = _full_detail(tool, tool_input, ctx)
-        loop = asyncio.get_running_loop()
-        signals.static_stop()
-        log(f"[perm]   asking: {what}")
-        log(f"[perm]   detail: {detail}")
-        if tool == "Bash":   # the FULL command always reaches the log
-            log(f"[perm]   full command: {str((tool_input or {}).get('command', ''))[:2000]}")
-        ask = f"Permission check. I want to {what}. Yes, no, or details?"
-        if not _PERM["hinted"]:
-            # the escape hatch announces itself exactly once, at the
-            # moment it becomes relevant (a field case: a new user
-            # couldn't find the phrase to turn the checks off)
-            _PERM["hinted"] = True
-            ask += (" And any time you're done with these checks, say "
-                    "stop asking for permission.")
-        mouth.say(ask)
-        answer = None
-        try:
-            deadline = loop.time() + PERM_TIMEOUT_S
-            while answer is None:
-                fut = loop.create_future()
-                _PERM["fut"] = fut
-                _PERM["asked_at"] = time.monotonic()
-                while True:
-                    try:
-                        got = await asyncio.wait_for(
-                            asyncio.shield(fut), 1.0)
-                        break
-                    except asyncio.TimeoutError:
-                        if loop.time() >= deadline:
-                            fut.cancel()
-                            mouth.say("No answer, so I didn't do it.")
-                            log("[perm]   timed out, denied")
-                            return PermissionResultDeny(
-                                behavior="deny",
-                                message="No spoken answer within the "
-                                        "timeout; the action was not "
-                                        "approved.",
-                                interrupt=False)
-                        # keep the ring honest while we wait
-                        if not mouth.speaking:
-                            signals.set_state("listening")
-                if (got != _INTERRUPT_ANSWER
-                        and _norm_speech(got) in _DETAILS):
-                    # read the full literal form, then ask again with a
-                    # fresh clock: asking for details is engagement,
-                    # not silence
-                    log("[perm]   details requested")
-                    mouth.say(f"The details: I want to {detail}. "
-                              "Yes or no?")
-                    deadline = loop.time() + PERM_TIMEOUT_S
-                    continue
-                answer = got
-        finally:
-            _PERM["fut"] = None
-        if answer == _INTERRUPT_ANSWER:
-            log("[perm]   turn interrupted, denied silently")
+        decision = _classify_permission(tool, tool_input)
+        if decision == "allow":
+            log(f"[perm]   auto-allowed by settings.json: "
+                f"{_human_what(tool, tool_input, ctx)}")
+            return PermissionResultAllow(behavior="allow")
+        if decision == "deny":
+            log(f"[perm]   auto-denied by settings.json: "
+                f"{_human_what(tool, tool_input, ctx)}")
             return PermissionResultDeny(
                 behavior="deny",
-                message="Interrupted by the user; the turn is being "
-                        "cancelled.",
+                message="Blocked by a deny rule in .claude/settings.json.",
                 interrupt=False)
-        approved = _norm_speech(answer) in _YES
-        # the model keeps working either way: restore the working state
-        signals.set_state("thinking")
-        signals.static_start()
-        if approved:
-            log("[perm]   approved by voice")
-            return PermissionResultAllow(behavior="allow")
-        log(f"[perm]   denied: {answer!r}")
-        return PermissionResultDeny(
-            behavior="deny",
-            message=f'Denied by voice. The user said: "{answer[:500]}"',
-            interrupt=False)
+        async with _PERM_LOCK:
+            what = _human_what(tool, tool_input, ctx)
+            detail = _full_detail(tool, tool_input, ctx)
+            loop = asyncio.get_running_loop()
+            signals.static_stop()
+            log(f"[perm]   asking: {what}")
+            log(f"[perm]   detail: {detail}")
+            if tool == "Bash":   # the FULL command always reaches the log
+                log(f"[perm]   full command: {str((tool_input or {}).get('command', ''))[:2000]}")
+            ask = f"Permission check. I want to {what}. Yes, no, or details?"
+            if not _PERM["hinted"]:
+                # the escape hatch announces itself exactly once, at the
+                # moment it becomes relevant (a field case: a new user
+                # couldn't find the phrase to turn the checks off)
+                _PERM["hinted"] = True
+                ask += (" And any time you're done with these checks, say "
+                        "stop asking for permission.")
+            mouth.say(ask)
+            answer = None
+            try:
+                deadline = loop.time() + PERM_TIMEOUT_S
+                while answer is None:
+                    fut = loop.create_future()
+                    _PERM["fut"] = fut
+                    _PERM["asked_at"] = time.monotonic()
+                    while True:
+                        try:
+                            got = await asyncio.wait_for(
+                                asyncio.shield(fut), 1.0)
+                            break
+                        except asyncio.TimeoutError:
+                            if loop.time() >= deadline:
+                                fut.cancel()
+                                mouth.say("No answer, so I didn't do it.")
+                                log("[perm]   timed out, denied")
+                                return PermissionResultDeny(
+                                    behavior="deny",
+                                    message="No spoken answer within the "
+                                            "timeout; the action was not "
+                                            "approved.",
+                                    interrupt=False)
+                            # keep the ring honest while we wait
+                            if not mouth.speaking:
+                                signals.set_state("listening")
+                    if (got != _INTERRUPT_ANSWER
+                            and _norm_speech(got) in _DETAILS):
+                        # read the full literal form, then ask again with a
+                        # fresh clock: asking for details is engagement,
+                        # not silence
+                        log("[perm]   details requested")
+                        mouth.say(f"The details: I want to {detail}. "
+                                  "Yes or no?")
+                        deadline = loop.time() + PERM_TIMEOUT_S
+                        continue
+                    answer = got
+            finally:
+                _PERM["fut"] = None
+            if answer == _INTERRUPT_ANSWER:
+                log("[perm]   turn interrupted, denied silently")
+                return PermissionResultDeny(
+                    behavior="deny",
+                    message="Interrupted by the user; the turn is being "
+                            "cancelled.",
+                    interrupt=False)
+            approved = _norm_speech(answer) in _YES
+            # the model keeps working either way: restore working state
+            signals.set_state("thinking")
+            signals.static_start()
+            if approved:
+                log("[perm]   approved by voice")
+                return PermissionResultAllow(behavior="allow")
+            log(f"[perm]   denied: {answer!r}")
+            return PermissionResultDeny(
+                behavior="deny",
+                message=f'Denied by voice. The user said: "{answer[:500]}"',
+                interrupt=False)
     return gate
 
 
@@ -579,10 +685,13 @@ def _typed_reader(q: "queue.Queue[str]"):
                 sys.stdout.flush()
 
 
-async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
+async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
+                      release_ts: float | None = None):
     """First sentence ships alone (fast start); the rest go in
     2-sentence breaths — fuller chunks get livelier prosody (single
-    short sentences come out flat)."""
+    short sentences come out flat). release_ts, when given, is the PTT
+    release moment — it rides along to the first chunk only, so mouth.py
+    can log the full release-to-audio round trip."""
     t0 = time.time()
     first = True
     batch: list[str] = []
@@ -606,9 +715,14 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if not s:
             return
         if first:
+            elapsed = time.time() - t0
+            tool_t = brain.tool_elapsed
+            gen_t = max(0.0, elapsed - tool_t)
+            log(f"[bench] brain: {elapsed:.2f}s to first sentence "
+                f"(tool {tool_t:.2f}s, gen {gen_t:.2f}s)")
             log(f"[{NAME}] ({time.time()-t0:.1f}s to first) {s}"
                 + (f"  <directions: {pending}>" if pending else ""))
-            mouth.say_chunk(s, pending)
+            mouth.say_chunk(s, pending, release_ts=release_ts)
             pending = []
             first = False
         else:
@@ -635,6 +749,18 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
             await brain.interrupt()
         except Exception:
             pass
+        raise
+    except Exception as e:
+        # Logged and re-raised unchanged — diagnostics only, behaviour
+        # is otherwise untouched.
+        log(f"[{NAME}] speak_reply failed: {e!r}")
+        if brain._broken:
+            # The client died mid-turn (see brain.ask_stream/reset_turn)
+            # — say so instead of just going quiet. reset_turn() rebuilds
+            # fresh before the next query, so this turn is a loss but
+            # the next one works.
+            mouth.say("That came back way too big and the connection "
+                      "choked on it. Give me a second to reset.")
         raise
 
 
@@ -698,12 +824,17 @@ async def amain():
     except (Exception, asyncio.TimeoutError) as e:
         kind = ("timed out" if isinstance(e, asyncio.TimeoutError)
                 else f"failed: {e!r}"[:220])
+        stderr_tail = brain.recent_stderr()
         log(f"[backtalk] BRAIN CONNECT {kind}")
-        mouth.say("Bad news. The voice and the face are fine, but I "
+        if stderr_tail:
+            log(f"[backtalk] CLI stderr:\n{stderr_tail}")
+        diagnosis = diagnose_connect_failure(e, stderr_tail)
+        mouth.say(diagnosis or (
+                  "Bad news. The voice and the face are fine, but I "
                   "couldn't reach my brain, the Claude Code session. "
                   "Check this window for the error. The usual causes: "
                   "Claude Code isn't signed in, the internet is down, "
-                  "or the plan is out of usage.")
+                  "or the plan is out of usage."))
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
     log("[backtalk] brain warm")
@@ -856,10 +987,13 @@ async def amain():
                 mouth.say(say_after)
         signals.set_state("idle")
 
-    async def handle(text: str, spoke_from: float | None = None) -> bool:
+    async def handle(text: str, spoke_from: float | None = None,
+                     release_ts: float | None = None) -> bool:
         """Process one utterance; returns False on quit. spoke_from is
         when the utterance STARTED (the PTT press), so an answer can be
-        told apart from speech that began before the ask even existed."""
+        told apart from speech that began before the ask even existed.
+        release_ts is when it ENDED (the PTT release, PTT-mode only) —
+        the start line for full round-trip latency benchmarking."""
         nonlocal speak_task
         log(f"[you]    {text}")
         # A pending spoken permission ask owns the next utterance IF
@@ -892,11 +1026,11 @@ async def amain():
                     "confirm", "confirmed", "yes confirm",
                     "yes confirmed"):
                 verb = pend + ":confirmed"
-            elif not expired and not any(q in text.lower()
+            elif not expired and not any(q in _norm_speech(text)
                                          for q in QUIT_PHRASES):
                 mouth.say("Staying as we are.")
                 return True
-        if any(q in text.lower() for q in QUIT_PHRASES):
+        if any(q in _norm_speech(text) for q in QUIT_PHRASES):
             if speak_task and not speak_task.done():
                 speak_task.cancel()
             mouth.shut_up()
@@ -933,7 +1067,8 @@ async def amain():
         # wait on a ResultMessage the CLI is withholding for an answer.
         _deny_pending()
         await brain.reset_turn()
-        speak_task = asyncio.create_task(speak_reply(brain, mouth, text))
+        speak_task = asyncio.create_task(
+            speak_reply(brain, mouth, text, release_ts=release_ts))
         return True
 
     try:
@@ -1022,8 +1157,9 @@ async def amain():
                 mouth.ducker.speech_start()      # duck NOW, while you talk
                 print("[ptt] recording (release to send)...", flush=True)
                 _MIC["btn"] = True               # open mic yields to the button
+                release_ts = None
                 try:
-                    text = await loop.run_in_executor(
+                    text, release_ts = await loop.run_in_executor(
                         None, lambda: record_held(ptt.is_held))
                 except Exception as e:
                     # A device-level failure gets plain words instead of a
@@ -1047,7 +1183,8 @@ async def amain():
                     log("[ptt] (tap or empty — ignored)")
                     signals.set_state("idle")
                     continue
-                if not await handle(text, spoke_from=press_t):
+                if not await handle(text, spoke_from=press_t,
+                                    release_ts=release_ts):
                     return
     except KeyboardInterrupt:
         pass
@@ -1060,6 +1197,11 @@ async def amain():
         signals.set_state("idle")
         await brain.stop()
         log("[backtalk] hung up")
+        # our own cleanup above is done; asyncio.run()'s own shutdown
+        # (cancelling stray tasks, closing the default executor) can hang
+        # on native-library threads (torch/kokoro), so exit immediately
+        # here rather than let control return through that teardown.
+        os._exit(0)
 
 
 # Loopback port used purely as a mutex. Nothing is ever served on it.
@@ -1111,6 +1253,7 @@ def main():
         asyncio.run(amain())
     except KeyboardInterrupt:
         print("\n[backtalk] interrupted — hanging up", flush=True)
+    os._exit(0)  # belt and suspenders: same reasoning as the exit above
 
 
 if __name__ == "__main__":

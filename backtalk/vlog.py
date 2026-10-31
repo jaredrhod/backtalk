@@ -62,6 +62,10 @@ _init_console()
 
 
 def log(line: str):
+    if line.startswith("[bench]"):
+        from backtalk.config import CFG
+        if not CFG.get("bench_log", True):
+            return
     try:
         print(line, flush=True)
     except UnicodeEncodeError:
