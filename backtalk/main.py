@@ -750,6 +750,18 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str,
         except Exception:
             pass
         raise
+    except Exception as e:
+        # Logged and re-raised unchanged — diagnostics only, behaviour
+        # is otherwise untouched.
+        log(f"[{NAME}] speak_reply failed: {e!r}")
+        if brain._broken:
+            # The client died mid-turn (see brain.ask_stream/reset_turn)
+            # — say so instead of just going quiet. reset_turn() rebuilds
+            # fresh before the next query, so this turn is a loss but
+            # the next one works.
+            mouth.say("That came back way too big and the connection "
+                      "choked on it. Give me a second to reset.")
+        raise
 
 
 async def amain():

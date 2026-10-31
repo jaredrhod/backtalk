@@ -125,6 +125,14 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # True when the CLIENT itself died mid-turn (its background reader
+        # task raised and exited — e.g. a tool result too large for the
+        # SDK's transport buffer), as opposed to a turn we cancelled on
+        # purpose. Draining a dead stream looks IDENTICAL to draining a
+        # healthy empty one (zero messages, no error), so reset_turn()
+        # checks this flag first rather than trusting that false "all
+        # clear" — see ask_stream and reset_turn.
+        self._broken = False
         # The CLI subprocess's own stderr for the CURRENT connect attempt.
         # Without this the SDK never pipes stderr at all (no callback ==
         # no PIPE), so a failed connect's ProcessError carries the literal
@@ -345,6 +353,16 @@ class WarmBrain:
         the last turn was consumed clean."""
         if not self._client or not self._dirty:
             return
+        if self._broken:
+            # The reader task is already dead — interrupting or draining
+            # it would just measure a corpse (0 messages, no error, the
+            # exact shape of a healthy empty drain). Skip straight to the
+            # same fresh rebuild a desync falls back to below.
+            log("[brain] client connection died mid-turn (reader task "
+                "exited) — rebuilding fresh rather than trusting a drain "
+                "on a dead stream")
+            await self._rebuild_fresh()
+            return
         try:
             await asyncio.wait_for(self._client.interrupt(), 5)
         except Exception:
@@ -369,13 +387,20 @@ class WarmBrain:
             # rest of the day.
             log("[brain] stream desynced beyond repair — rebuilding the "
                 "session (conversation memory for this session resets)")
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-            self._client = None
-            await self.start()
-            self._dirty = False
+            await self._rebuild_fresh()
+
+    async def _rebuild_fresh(self):
+        """Disconnect and reconnect with no resume — the pipe is beyond
+        trusting, so this always starts clean rather than gambling on
+        reattaching to whatever state the CLI thinks it was in."""
+        try:
+            await self._client.disconnect()
+        except Exception:
+            pass
+        self._client = None
+        self._broken = False
+        await self.start()
+        self._dirty = False
 
     async def stop(self):
         if self._client:
@@ -395,56 +420,67 @@ class WarmBrain:
         _pending_tool_ids: set[str] = set()
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
-            t = type(msg).__name__
-            if t == "AssistantMessage":
-                ids = {b.id for b in (msg.content or [])
-                      if isinstance(b, ToolUseBlock)}
-                if ids:
-                    if not _pending_tool_ids:
-                        _tool_start = time.time()
-                    _pending_tool_ids |= ids
-            elif t == "UserMessage":
-                content = msg.content
-                if isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, ToolResultBlock):
-                            _pending_tool_ids.discard(b.tool_use_id)
-                    if not _pending_tool_ids and _tool_start is not None:
-                        self.tool_elapsed += time.time() - _tool_start
-                        _tool_start = None
-            elif t == "StreamEvent":
-                ev = getattr(msg, "event", {}) or {}
-                if ev.get("type") == "content_block_delta":
-                    delta = ev.get("delta", {}) or {}
-                    if delta.get("type") == "text_delta":
-                        buf += delta.get("text", "")
-                        # emit any complete sentences
-                        while True:
-                            m = _SENTENCE_END.search(buf)
-                            if not m:
-                                break
-                            sentence, buf = (buf[:m.end()].strip(),
-                                             buf[m.end():])
-                            if sentence:
-                                yield sentence
-                elif ev.get("type") == "content_block_stop":
-                    # End of a speech block (e.g. right before a tool
-                    # call): flush NOW. Without this, pre-tool filler
-                    # ("On it — let me grab that.") sits silent in the
-                    # buffer through the whole tool run, then plays
-                    # glued to the answer: long dead air, then two
-                    # thoughts at once.
-                    tail = buf.strip()
-                    buf = ""
-                    if tail:
-                        yield tail
-            elif t == "ResultMessage":
-                self._dirty = False    # turn fully consumed — pipe aligned
-                self._tally(msg)
-                self._remember_session(msg)
-                await self._pull_rate_limits()
-                break
+        try:
+            async for msg in self._client.receive_response():
+                t = type(msg).__name__
+                if t == "AssistantMessage":
+                    ids = {b.id for b in (msg.content or [])
+                          if isinstance(b, ToolUseBlock)}
+                    if ids:
+                        if not _pending_tool_ids:
+                            _tool_start = time.time()
+                        _pending_tool_ids |= ids
+                elif t == "UserMessage":
+                    content = msg.content
+                    if isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, ToolResultBlock):
+                                _pending_tool_ids.discard(b.tool_use_id)
+                        if not _pending_tool_ids and _tool_start is not None:
+                            self.tool_elapsed += time.time() - _tool_start
+                            _tool_start = None
+                elif t == "StreamEvent":
+                    ev = getattr(msg, "event", {}) or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {}) or {}
+                        if delta.get("type") == "text_delta":
+                            buf += delta.get("text", "")
+                            # emit any complete sentences
+                            while True:
+                                m = _SENTENCE_END.search(buf)
+                                if not m:
+                                    break
+                                sentence, buf = (buf[:m.end()].strip(),
+                                                 buf[m.end():])
+                                if sentence:
+                                    yield sentence
+                    elif ev.get("type") == "content_block_stop":
+                        # End of a speech block (e.g. right before a tool
+                        # call): flush NOW. Without this, pre-tool filler
+                        # ("On it — let me grab that.") sits silent in the
+                        # buffer through the whole tool run, then plays
+                        # glued to the answer: long dead air, then two
+                        # thoughts at once.
+                        tail = buf.strip()
+                        buf = ""
+                        if tail:
+                            yield tail
+                elif t == "ResultMessage":
+                    self._dirty = False    # turn consumed — pipe aligned
+                    self._tally(msg)
+                    self._remember_session(msg)
+                    await self._pull_rate_limits()
+                    break
+        except asyncio.CancelledError:
+            raise   # we did that on purpose (an interrupt) — not a break
+        except Exception:
+            # The reader task pumping self._client died outright instead
+            # of this turn merely being interrupted — e.g. a tool result
+            # too large for the SDK's transport buffer. Flag it so
+            # reset_turn() skips straight to a fresh rebuild instead of
+            # trusting a drain on a stream that's gone for good.
+            self._broken = True
+            raise
         tail = buf.strip()
         if tail:
             yield tail
