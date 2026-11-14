@@ -5,6 +5,9 @@ description = "Talk to your Claude Code agent out loud. Hold a key, speak, and i
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "claude-agent-sdk>=0.2.100",
+    # Linux only: push-to-talk's fallback for Wayland sessions, where
+    # pynput's X11-only global grab silently never fires. See ptt.py.
+    "evdev>=1.6.0 ; sys_platform == 'linux'",
     "faster-whisper>=1.0.0",
     "httpx>=0.27.0",
     "kokoro>=0.9.0",
